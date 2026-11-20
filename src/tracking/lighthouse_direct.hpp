@@ -86,6 +86,18 @@ class LighthouseDirect {
     double a[3] = {};  // base frame, gravity removed: the newest sample's (or the state's)
   };
   Predicted PredictNow() const;
+  // Not stock: how far a filter's IMU calibration sits from this device's factory one
+  // (the model's): accelerometer bias m/s2, accelerometer scale, gyro bias rad/s (largest axis).
+  struct CalibrationOffsets { double accBias, accScale, gyroBias; };
+  CalibrationOffsets CalibrationOffset(const direct::DirectFilter& f) const;
+  // Not stock: whether that calibration is one a healthy unit could have (limits below;
+  // always true without the improvements). Anything else is damage, and passing
+  // CalibrationHealthy() it used to be carried across every reset, for good: it is never
+  // carried or kept as the calm one now.
+  static constexpr double kMaxAccBiasOffset = 4.0;    // m/s2
+  static constexpr double kMaxAccScaleOffset = 0.15;
+  static constexpr double kMaxGyroBiasOffset = 1.0;   // rad/s
+  bool CalibrationPlausible(const direct::DirectFilter& f) const;
   // Not stock, for sorting LH1 pulses (tracking/pulse_sorter.hpp): where the pose, carried
   // forward like PredictNow's, puts this sensor's hit at time t, for both planes of every base
   // in the filter. Returns how many entries (8 at most); none without a pose worth asking.
@@ -185,6 +197,8 @@ class LighthouseDirect {
   double vibratingUntil_ = -1e300, vibrationAccelScale_ = 1.0;
   std::array<std::array<double, 3>, 2> prevAccel_{};  // last sample, the one before
   int havePrevAccel_ = 0;
+  double vibrationTime_ = -1e300;
+  void TrackVibration(const ImuSample& sample, double dt);
   static constexpr double kVibrationJitter = 1.5, kVibrationRoughness = 1.4, kVibrationAccelScale = 100;
   double sweepInterval_ = 1.0 / 60;
   std::optional<double> observedTime_;

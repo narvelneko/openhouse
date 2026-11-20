@@ -297,7 +297,10 @@ bool DirectFilter::Update(const std::vector<Residual>& res, const Mat& R, const 
     // / 92 / 98 %, the light used 42 / 52 / 90 / 84 %, jumps > 5 cm 142 / 58 / 67 / 3.)
     K.middleRows(16, std::min(n, 49) - 16).setZero();
   } else if (holdImuCalibration && n > 30) {
-    K.middleRows(18, 13).setZero();
+    // The primary base's tilt (16-17) too: held without it, the vibration went into the
+    // tilt instead and the device sat 2-6 cm off after it (Haptics.VibrationDoesNotGetInto
+    // TheCalibration).
+    K.middleRows(16, 15).setZero();
   }
   Vec dx = K * y;
   // Not stock: a relearning (knocked) base whose light asks for more than the

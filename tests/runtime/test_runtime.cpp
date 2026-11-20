@@ -1272,3 +1272,266 @@ TEST(RoomMap, RoomLearnedWithoutModelScalesIsRefinedOnce) {
   std::filesystem::remove(path);
   for (const auto& line : again.TakeLogs()) EXPECT_EQ(line.find("model scales"), std::string::npos);
 }
+
+namespace {
+using namespace lh;
+using namespace lh::runtime;
+
+// Haptics (GitHub report: an Index controller in a game's sustained haptics, a tracker
+// stomped on; LighthouseDirect::OnImu). A device swaying in the hand whose accelerometer,
+// 250 Hz as on a controller or tracker, also sees a vibration; the light comes from its
+// true pose throughout. Then, long after, it is hidden for a second.
+struct VibrationRun {
+  double hz = 160, amp = 20;      // the vibration (or the ringing after a stomp), m/s2 per axis
+  double start = 4, end = 7;      // s
+  bool stomp = false;             // at `start`: an impact past the accelerometer's range, then ringing
+  int axes = 7;                   // accelerometer axes it shakes (bit mask)
+  double dc = 0;                  // a constant offset on those axes, m/s2, over start..end (no vibration at amp = 0)
+  double gyroAmp = 0;             // the same vibration on the gyro, rad/s
+  double hideFrom = 14, hideTo = 15, total = 20;  // hidden (no light) from..to, s
+  double hide2From = 0, hide2To = 0;              // and a second time
+  // Results: filter position error after the first second, from 1 s after the vibration
+  // (light), and while hidden (first, second time); resets; the highest vibration level seen.
+  double maxErr = 0, maxErrAfter = 0, maxErrHidden = 0, maxErrHidden2 = 0;
+  // Error while vibrating with light (start..end); the last time after `end` the device was
+  // off by more than 1 cm or not tracking (0 = never; seconds after `end`); the calibration
+  // learnt, worst over the run and at its end: accelerometer bias (m/s2), |scale - 1|.
+  double maxErrDuring = 0, lastBad = 0;
+  double maxBias = 0, maxScaleErr = 0, finalBias = 0, finalScaleErr = 0;
+  int resets = 0;
+  bool held = false;  // the calibration was held at some point
+  std::string logs;
+};
+
+// The true motion at device time T (base frame: the base looks down -z, y up): rotation
+// of +-26 deg about a tilted axis at 0.4 Hz and a few cm of translation.
+struct Truth {
+  Eigen::Matrix3d R;
+  Eigen::Vector3d p, a, w;  // position, acceleration (base frame), angular velocity (body)
+};
+Truth TrueMotion(double T) {
+  Truth t;
+  const Eigen::Vector3d axis = Eigen::Vector3d(0.3, 1, 0.5).normalized();
+  const double wf = 2 * M_PI * 0.4, amp = 0.45;
+  t.R = Eigen::AngleAxisd(amp * std::sin(wf * T), axis).toRotationMatrix();
+  t.w = amp * wf * std::cos(wf * T) * axis;
+  const double pa = 0.08, pf = 2 * M_PI * 0.3;
+  t.p = Eigen::Vector3d(pa * std::sin(pf * T), 0.5 * pa * std::sin(2 * pf * T), -2);
+  t.a = Eigen::Vector3d(-pa * pf * pf * std::sin(pf * T), -2 * pa * pf * pf * std::sin(2 * pf * T), 0);
+  return t;
+}
+
+void RunVibration(VibrationRun* run) {
+  TrackedObjectModel model;
+  model.points = {{{-0.08, -0.07, -0.02}}, {{0.08, -0.07, 0.02}}, {{-0.08, 0.07, 0.03}},
+                  {{0.08, 0.07, -0.03}}, {{0, 0, 0.08}}, {{0.04, 0.01, -0.06}}};
+  model.normals.assign(6, {0, 0, 1});
+  for (int i = 0; i < 6; ++i) model.channelToIndex[i] = i;
+  RoomMap room;
+  DeviceTracker tracker("LHR-VIBRATE", model, &room);
+  BaseConfig base;
+  base.valid = true; base.serial = 1; base.cal.assign(14, 0.0);
+  BaseDynamicState dynamic;
+  dynamic.accelDir = {0, 1, 0};
+  tracker.OnBaseConfig(base, dynamic);
+  constexpr double kRange = 78.4532;  // m/s2, an Index accelerometer's (8 g)
+  double imuTime = 1;
+  for (int step = 0; step < int(run->total * 120); ++step) {
+    OpticalFrame f;
+    f.baseSerial = 1; f.axis = step % 2;
+    f.syncTime = 1 + step / 120.0;
+    f.nextSyncTime = f.syncTime + 1.0 / 120;
+    f.idealPeriod = f.averagePeriod = 1.0 / 60;
+    f.leftSyncIsReal = f.rightSyncIsReal = true;
+    const double cal[7]{};
+    for (size_t i = 0; i < model.points.size(); ++i) {
+      OpticalSample s;
+      s.sensor = int(i); s.axis = f.axis; s.width = 5e-6;
+      s.time = f.syncTime + 0.004 + double(i) * 1e-5;
+      const Truth tr = TrueMotion(s.time);
+      const Eigen::Vector3d q = tr.R * Eigen::Vector3d(model.points[i][0], model.points[i][1], model.points[i][2]) + tr.p;
+      s.angle = model::Lh1Angle(s.axis, q[0], q[1], q[2], cal);
+      f.samples.push_back(s);
+    }
+    while (imuTime < f.nextSyncTime) {
+      ImuSample imu;
+      imu.time = imuTime;
+      const Truth tr = TrueMotion(imuTime);
+      const Eigen::Vector3d specific = tr.R.transpose() * (tr.a + Eigen::Vector3d(0, 9.80665, 0));
+      const Eigen::Vector3d gyro = tr.R.transpose() * tr.w;
+      for (int i = 0; i < 3; ++i) { imu.accel[size_t(i)] = specific[i]; imu.gyro[size_t(i)] = gyro[i]; }
+      const double t = imuTime - 1;
+      if (run->stomp && t >= run->start) {
+        const double since = t - run->start;
+        if (since < 0.02) imu.accel[1] += 150 * std::sin(M_PI * since / 0.02);
+        else imu.accel[1] += run->amp * std::exp(-(since - 0.02) / 0.4) * std::sin(2 * M_PI * run->hz * since);
+      } else if (!run->stomp && t >= run->start && t < run->end) {
+        // Faded in and out over 0.1 s.
+        const double ramp = std::min({1.0, (t - run->start) / 0.1, (run->end - t) / 0.1});
+        const double fade = 0.5 - 0.5 * std::cos(M_PI * ramp);
+        for (int i = 0; i < 3; ++i) {
+          if (run->axes & (1 << i)) imu.accel[size_t(i)] += fade * (run->amp * std::sin(2 * M_PI * run->hz * t + i) + run->dc);
+          imu.gyro[size_t(i)] += fade * run->gyroAmp * std::sin(2 * M_PI * run->hz * t + 2 * i);
+        }
+      }
+      for (size_t i = 0; i < 3; ++i)
+        if (std::fabs(imu.accel[i]) >= kRange) { imu.accel[i] = std::copysign(kRange, imu.accel[i]); imu.saturated |= 1u << i; }
+      tracker.OnImu(imu);
+      imuTime += 0.004;
+    }
+    tracker.Process(nullptr);
+    const double t = step / 120.0;
+    const bool hidden1 = t >= run->hideFrom && t < run->hideTo, hidden2 = t >= run->hide2From && t < run->hide2To;
+    const bool hidden = hidden1 || hidden2;
+    if (!hidden) DeviceTrackerTestAccess::Frame(tracker, f);
+    for (const auto& line : tracker.TakeLogs()) {
+      run->resets += line.find("Resetting") != std::string::npos || line.find("reacquiring") != std::string::npos ||
+                     line.find("Calibration failed") != std::string::npos;
+      char stamp[16];
+      std::snprintf(stamp, sizeof stamp, "%6.2f ", t);
+      run->logs += stamp + line + "\n";
+    }
+    auto& core = DeviceTrackerTestAccess::Core(tracker);
+    if (!core.Bootstrapped()) {
+      if (t > run->end && !hidden) run->lastBad = t - run->end;
+      continue;
+    }
+    run->held |= core.Filter().holdSlowStates || core.Filter().holdImuCalibration;
+    const auto& x = core.Filter().x;
+    const double e = (Eigen::Vector3d(x[0], x[1], x[2]) - TrueMotion(core.Time()).p).norm();
+    if (t > 1) run->maxErr = std::max(run->maxErr, e);
+    if (t > run->end + 1 && !hidden) run->maxErrAfter = std::max(run->maxErrAfter, e);
+    if (hidden1) run->maxErrHidden = std::max(run->maxErrHidden, e);
+    if (hidden2) run->maxErrHidden2 = std::max(run->maxErrHidden2, e);
+    if (t > run->start && t < run->end && !hidden) run->maxErrDuring = std::max(run->maxErrDuring, e);
+    if (t > run->end && !hidden && e > 0.01) run->lastBad = t - run->end;
+    // The factory calibration of the synthetic device: no bias, unit scale.
+    double bias = 0, scale = 0;
+    for (int i = 0; i < 3; ++i) {
+      bias = std::max(bias, std::fabs(x[22 + i]));
+      scale = std::max(scale, std::fabs(x[25 + i] - 1));
+    }
+    run->maxBias = std::max(run->maxBias, bias);
+    run->maxScaleErr = std::max(run->maxScaleErr, scale);
+    run->finalBias = bias;
+    run->finalScaleErr = scale;
+  }
+}
+
+// Without the vibration hold: 1-27 resets and fly-aways of 1-6.6 m while vibrating (from
+// 5 m/s2); after 320 Hz 20 m/s2 the calibration learnt stayed wrong and the device ran
+// 2 m off with the light on it; hidden later, 5-10 cm off where a calm device drifts 1 mm.
+// Holding the IMU calibration but not the tilt, or tracking the vibration only from
+// ImuUpdate (it starts over with every reset), 2-6 cm off after it.
+TEST(Haptics, VibrationDoesNotGetIntoTheCalibration) {
+  VibrationRun calm;
+  calm.amp = 0;
+  RunVibration(&calm);
+  EXPECT_EQ(calm.resets, 0) << calm.logs;
+  EXPECT_LT(calm.maxErr, 0.005);
+  EXPECT_LT(calm.maxErrHidden, 0.005);
+  // A swaying hand is not vibrating: its calibration is never held for it.
+  EXPECT_FALSE(calm.held);
+  for (auto [hz, amp] : {std::pair{80.0, 5.0}, {160.0, 20.0}, {320.0, 20.0}, {320.0, 50.0}}) {
+    VibrationRun run;
+    run.hz = hz; run.amp = amp;
+    RunVibration(&run);
+    SCOPED_TRACE(std::to_string(int(hz)) + " Hz " + std::to_string(int(amp)) + " m/s2");
+    EXPECT_TRUE(run.held);
+    EXPECT_EQ(run.resets, 0) << run.logs;
+    EXPECT_LT(run.maxErr, 0.1);
+    EXPECT_LT(run.maxErrAfter, 0.01);
+    EXPECT_LT(run.maxErrHidden, 0.01);
+  }
+}
+
+// A stomp: the accelerometer clips (already held, for 0.3 s), and the device rings on for a
+// second. Without the vibration hold, after one ringing at 80 Hz the tracker was 5.7 m off
+// for good, the light on it.
+TEST(Haptics, AStompsRingingDoesNotGetIntoTheCalibration) {
+  for (double hz : {80.0, 320.0}) {
+    VibrationRun run;
+    run.stomp = true; run.hz = hz; run.amp = 50; run.end = run.start + 1;
+    RunVibration(&run);
+    SCOPED_TRACE(std::to_string(int(hz)) + " Hz");
+    EXPECT_EQ(run.resets, 0) << run.logs;
+    EXPECT_LT(run.maxErr, 0.02);
+    EXPECT_LT(run.maxErrAfter, 0.01);
+    EXPECT_LT(run.maxErrHidden, 0.01);
+  }
+}
+
+std::string Summary(const VibrationRun& r) {
+  char buf[400];
+  std::snprintf(buf, sizeof buf,
+                "resets=%d error: during=%.4f after=%.4f hidden=%.4f/%.4f m, last off-track %.1f s after the end; "
+                "accel bias max %.3f final %.3f m/s2, scale off max %.3f final %.3f",
+                r.resets, r.maxErrDuring, r.maxErrAfter, r.maxErrHidden, r.maxErrHidden2, r.lastBad, r.maxBias,
+                r.finalBias, r.maxScaleErr, r.finalScaleErr);
+  return buf;
+}
+
+// Occlusion in the middle of a vibration. The filter flies on its IMU alone, the
+// accelerometer trusted 100x less: 1 s hidden mid-vibration it is 3 cm (80 Hz 5 m/s2) to
+// 0.9 m (320 Hz 50) off and resets once, as stock loses it. What must not happen is what
+// issue 90 reported: the vibration over, nothing of it is left in the calibration (no calm
+// calibration is taken while vibrating), and the next occlusion is a calm device's (1 mm).
+TEST(Haptics, HiddenWhileVibrating) {
+  struct Case { double hz, amp, gyro; };
+  for (Case c : {Case{160, 20, 0}, {80, 5, 0}, {320, 50, 0}, {160, 20, 1}}) {
+    VibrationRun run;
+    run.hz = c.hz; run.amp = c.amp; run.gyroAmp = c.gyro;
+    run.hideFrom = 5; run.hideTo = 6;  // inside 4..7
+    run.hide2From = 14; run.hide2To = 15;
+    RunVibration(&run);
+    SCOPED_TRACE(std::to_string(int(c.hz)) + " Hz " + std::to_string(int(c.amp)) + " m/s2 gyro " + std::to_string(int(c.gyro)) + ": " + Summary(run));
+    EXPECT_LE(run.resets, 1) << run.logs;
+    EXPECT_LT(run.lastBad, 0.5);
+    EXPECT_LT(run.maxErrAfter, 0.01);
+    EXPECT_LT(run.maxErrHidden2, 0.01);
+    EXPECT_LT(run.finalBias, 0.1);
+    EXPECT_LT(run.finalScaleErr, 0.02);
+  }
+}
+
+// Vibration the detector barely or doesn't see, for 30 s: 80 Hz 1.35 m/s2 on three axes, 160 Hz
+// 2 m/s2 on one. Any accelerometer error beyond the measurement variance is rectified into
+// the accelerometer scale and bias: without the vibration handling, 14 resets and a scale 49 %
+// off (80 Hz), a scale 30 % off and bias 2.2 m/s2 for good, 5 cm off when hidden after
+// (160 Hz, one axis). Now no resets, the scale under 8 % off, about 1 cm when hidden after.
+TEST(Haptics, QuietVibrationForLong) {
+  struct Case { double hz, amp; int axes; };
+  for (Case c : {Case{80, 1.35, 7}, {160, 2, 2}}) {
+    VibrationRun run;
+    run.hz = c.hz; run.amp = c.amp; run.axes = c.axes;
+    run.start = 4; run.end = 34; run.hideFrom = 36; run.hideTo = 37; run.total = 40;
+    RunVibration(&run);
+    SCOPED_TRACE(std::to_string(c.hz) + " Hz " + std::to_string(c.amp) + " m/s2 axes " + std::to_string(c.axes) + ": " + Summary(run));
+    EXPECT_EQ(run.resets, 0) << run.logs;
+    EXPECT_LT(run.maxErrDuring, 0.01);
+    EXPECT_LT(run.maxErrHidden, 0.03);
+    EXPECT_LT(run.maxScaleErr, 0.1);
+    EXPECT_LT(run.finalBias, 0.4);
+  }
+}
+
+// What the vibration detector cannot see: a constant accelerometer offset (2 m/s2 for 3 s)
+// and a tone near the 250 Hz sampling rate (255 Hz aliases to 5 Hz: 6-7 m off while it lasts).
+// The calibration learnt from them fails CalibrationPlausible (scale 61-93 % off, bias
+// 3.9-9 m/s2), so it is never carried into a reacquire nor kept as the calm one: before, it
+// was, and 255 Hz 10 m/s2 left the device 6.7 m off with the scale 87 % off for good. The DC
+// case still takes a reset to clear, 8 s after it.
+TEST(Haptics, RecoversFromAWrongCalibration) {
+  struct Case { const char* name; double hz, amp, dc; };
+  for (Case c : {Case{"DC 2 m/s2", 0, 0, 2}, {"255 Hz 10 m/s2", 255, 10, 0}, {"255 Hz 30 m/s2", 255, 30, 0}}) {
+    VibrationRun run;
+    run.hz = c.hz; run.amp = c.amp; run.dc = c.dc;
+    RunVibration(&run);  // 4..7, hidden 14..15 of 20
+    SCOPED_TRACE(std::string(c.name) + ": " + Summary(run));
+    EXPECT_LT(run.lastBad, c.dc ? 10.0 : 3.0);
+    if (!c.dc) EXPECT_LT(run.maxErrHidden, 0.01);
+    EXPECT_LT(run.finalBias, 0.2);
+    EXPECT_LT(run.finalScaleErr, 0.03);
+  }
+}
+}  // namespace

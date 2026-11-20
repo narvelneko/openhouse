@@ -414,7 +414,7 @@ std::vector<std::shared_ptr<const Keyframe>> DeviceTracker::TakeKeyframes() {
 
 void DeviceTracker::OnAcquired() {
   acquiredAt_ = Now();
-  if (carry_ && !carry_->CalibrationHealthy()) {
+  if (carry_ && (!carry_->CalibrationHealthy() || !filter_->CalibrationPlausible(*carry_))) {
     Log("discarding invalid cached IMU calibration before reacquisition");
     carry_.reset();
   }
@@ -583,12 +583,23 @@ void DeviceTracker::SyncRoom() {
   }
 }
 
+void DeviceTracker::KeepCalibration(const direct::DirectFilter& f) {
+  if (f.updateCount <= 200 || !f.CalibrationHealthy()) return;
+  if (filter_->CalibrationPlausible(f)) carry_ = f;
+  else if (calm_) carry_ = calm_;
+  else carry_.reset();
+}
+
 void DeviceTracker::CheckHealth() {
   if (!filter_->Bootstrapped()) return;
   {
     const auto& f = filter_->Filter();
     // Every 100 optical updates of calm tracking (about 2 s), the calibration is kept.
-    if (f.holdSlowStates || f.updateCount < 200 || !f.CalibrationHealthy()) calmUpdates_ = f.updateCount;
+    const bool plausible = filter_->CalibrationPlausible(f);
+    // Not stock: nor while vibrating (holdImuCalibration): a calm calibration taken then
+    // carried the shaking into the next reacquire (Haptics.HiddenWhileVibrating: 6-8 mm off
+    // after, bias 0.09 m/s2 instead of 0.6 mm and 0.003), and nor an implausible one.
+    if (f.holdSlowStates || f.holdImuCalibration || f.updateCount < 200 || !f.CalibrationHealthy() || !plausible) calmUpdates_ = f.updateCount;
     else if (f.updateCount >= calmUpdates_ + 100) { calm_ = f; calmUpdates_ = f.updateCount; }
   }
   // The stock 0x358300 check assumes device timestamps advance. After a power
@@ -602,7 +613,7 @@ void DeviceTracker::CheckHealth() {
   if (backwardPulses_ >= kBackwardPulseReset) {
     Log("no forward light timestamps since reset; restarting acquisition");
     const auto& f = filter_->Filter();
-    if (f.updateCount > 200 && f.CalibrationHealthy()) carry_ = f;  // the IMU's calibration outlives the epoch
+    KeepCalibration(f);  // the IMU's calibration outlives the epoch
     ResetFilter();
     return;
   }
@@ -633,7 +644,7 @@ void DeviceTracker::CheckHealth() {
                     on, primary, on, reacquireBurst_ + 1);
       Log(text);
       const auto& f = filter_->Filter();
-      if (f.updateCount > 200 && f.CalibrationHealthy()) carry_ = f;
+      KeepCalibration(f);
       ResetFilter();
       avoidBase_ = std::make_pair(primary, now + 1.0);
       switchedAt_ = now;
@@ -671,7 +682,7 @@ void DeviceTracker::CheckHealth() {
                     std::min(9999.0, (Now() - primaryLast) * 1000), visible);
       Log(text);
       const auto f = filter_->Filter();
-      if (f.updateCount > 200 && f.CalibrationHealthy()) carry_ = f;
+      KeepCalibration(f);
       // Hand the pose over to the new base through the room map instead of losing
       // tracking until it bootstraps again (a headset turns its sensors away from the
       // primary base all the time; each reset blanked the view for a moment).
@@ -740,7 +751,7 @@ void DeviceTracker::CheckHealth() {
       if (calm_) carry_ = calm_;
       else carry_.reset();
     } else if (f.updateCount > 200) {
-      carry_ = f;
+      KeepCalibration(f);
     }
   } else {
     // Never reseed the very calibration rejected by HealthCheck: that creates

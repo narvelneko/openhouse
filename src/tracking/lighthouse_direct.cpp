@@ -55,9 +55,38 @@ void LighthouseDirect::SetRecordedTilt(uint32_t serial, std::array<double, 2> ti
 
 void LighthouseDirect::OnImu(const ImuSample& s) {
   if (!observedTime_ || s.time > *observedTime_) observedTime_ = s.time;
+  // Vibration is tracked from each sample's arrival, not in ImuUpdate: a filter reset (a new
+  // LighthouseDirect) mid-vibration then has its ~0.25 s average ready by bootstrap, instead
+  // of calibrating from the shaking until it caught up (a synthetic 80-320 Hz vibration: 2-6 cm
+  // off after it, with the tilt held too). A gap starts it over.
+  if (s.time > vibrationTime_) {
+    const double dt = s.time - vibrationTime_;
+    if (dt > 0.1) havePrevAccel_ = 0;
+    TrackVibration(s, dt);
+    vibrationTime_ = s.time;
+  }
   imu_.push_back(s);
   // Bounded pre-bootstrap buffer. Original queue/reset policies are still TODO.
   while (imu_.size() > 2000) imu_.pop_front();
+}
+
+void LighthouseDirect::TrackVibration(const ImuSample& sample, double dt) {
+  if (havePrevAccel_ > 1) {
+    double d1 = 0, d2 = 0;
+    for (int i = 0; i < 3; ++i) {
+      const double a = sample.accel[size_t(i)], p = prevAccel_[0][size_t(i)], q = prevAccel_[1][size_t(i)];
+      d1 += (a - p) * (a - p);
+      d2 += (a - 2 * p + q) * (a - 2 * p + q);
+    }
+    const double k = std::min(1.0, dt / 0.25);
+    accelJitter_ += k * (std::sqrt(d1) - accelJitter_);
+    accelRoughness_ += k * (std::sqrt(d2) - accelRoughness_);
+    if (accelJitter_ > kVibrationJitter && accelRoughness_ > kVibrationRoughness * accelJitter_)
+      vibratingUntil_ = sample.time + 0.5;
+  }
+  prevAccel_[1] = prevAccel_[0];
+  prevAccel_[0] = sample.accel;
+  havePrevAccel_ = std::min(havePrevAccel_ + 1, 2);
 }
 
 int LighthouseDirect::Slot(uint32_t serial) const {
@@ -166,31 +195,16 @@ bool LighthouseDirect::ImuUpdate(const ImuSample& sample) {
     // reaching their limits: the accelerometer jumps 2-4 m/s2 from one sample to the next
     // and its average reads 11-12.5 m/s2, not 9.8. Learned from that, the IMU alignment came
     // out 17-21 deg off within 1.5 s of every reacquire, tracking reset over and over and
-    // the controller flew off between. From then until 0.5 s after, gravity and the
-    // IMU calibration are held and the accelerometer is trusted 100x less (from the next
-    // sample), so the light carries the pose. Vibration is told from a hard swing, which
-    // jumps as much per sample, by its roughness: the second difference over the first
-    // (both averaged over ~0.25 s) is ~1.9 (the reading flips nearly every sample), a
+    // the controller flew off between. From then until 0.5 s after, gravity, the IMU
+    // calibration and the primary base's tilt are held and the accelerometer is trusted
+    // 100x less (from the next sample), so the light carries the pose. Vibration is told
+    // from a hard swing, which jumps as much per sample, by its roughness: the second
+    // difference over the first (both averaged over ~0.25 s) is ~1.9 (the reading flips
+    // nearly every sample), a
     // swing's or a stomp's 0.4-1.0. (two controllers' recordings: resets 21/8 and
     // 17 -> 0-1, steps > 5 cm 387/246 and 93 -> 1-43. Held as violent motion instead,
     // frames rejected too: a vibrating pickup in vrchat-01 flew off 4 m. On the jumps
     // alone, without roughness, hard swings jumped twice as often.)
-    if (havePrevAccel_ > 1) {
-      double d1 = 0, d2 = 0;
-      for (int i = 0; i < 3; ++i) {
-        const double a = sample.accel[size_t(i)], p = prevAccel_[0][size_t(i)], q = prevAccel_[1][size_t(i)];
-        d1 += (a - p) * (a - p);
-        d2 += (a - 2 * p + q) * (a - 2 * p + q);
-      }
-      const double k = std::min(1.0, dt / 0.25);
-      accelJitter_ += k * (std::sqrt(d1) - accelJitter_);
-      accelRoughness_ += k * (std::sqrt(d2) - accelRoughness_);
-      if (accelJitter_ > kVibrationJitter && accelRoughness_ > kVibrationRoughness * accelJitter_)
-        vibratingUntil_ = sample.time + 0.5;
-    }
-    prevAccel_[1] = prevAccel_[0];
-    prevAccel_[0] = sample.accel;
-    havePrevAccel_ = std::min(havePrevAccel_ + 1, 2);
     const bool vibrating = swing_ && sample.time < vibratingUntil_;
     filter_.holdImuCalibration = vibrating;
     vibrationAccelScale_ = vibrating ? kVibrationAccelScale : 1.0;
@@ -735,6 +749,22 @@ std::vector<LighthouseDirect::AltEstimate> LighthouseDirect::AltEstimates() cons
     out.push_back(e);
   }
   return out;
+}
+
+LighthouseDirect::CalibrationOffsets LighthouseDirect::CalibrationOffset(const direct::DirectFilter& f) const {
+  CalibrationOffsets o{0, 0, 0};
+  for (size_t i = 0; i < 3; ++i) {
+    o.accBias = std::max(o.accBias, std::fabs(f.x[22 + i] - double(float(model_.accBias[i]))));
+    o.accScale = std::max(o.accScale, std::fabs(f.x[25 + i] - double(float(model_.accScale[i]))));
+    o.gyroBias = std::max(o.gyroBias, std::fabs(f.x[19 + i] - double(float(model_.gyroBias[i]))));
+  }
+  return o;
+}
+
+bool LighthouseDirect::CalibrationPlausible(const direct::DirectFilter& f) const {
+  if (!swing_) return true;
+  const auto o = CalibrationOffset(f);
+  return o.accBias < kMaxAccBiasOffset && o.accScale < kMaxAccScaleOffset && o.gyroBias < kMaxGyroBiasOffset;
 }
 
 bool LighthouseDirect::SeedPose(const Seed& seed) {

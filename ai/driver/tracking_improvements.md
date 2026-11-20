@@ -382,3 +382,42 @@ could reuse the old resting place until the device moved again (issue #47, findi
   requires the hold to be gone. Commenting out the reset makes the test fail with the
   old held pose still present; the restored fix passes it. Full runtime suite: 25/25
   passed. Full unit suite: 30 passed, 1 skipped. No live hardware improvement is claimed.
+
+## Vibration (#90): additions to the haptics hold (2026-11-13)
+
+Upstream's fix (`LighthouseDirect::ImuUpdate`, 589bbd9): accelerometer jitter over 1.5 m/s2
+with roughness over 1.4x it holds gravity and the IMU calibration for 0.5 s and trusts the
+accelerometer 100x less. On top of it:
+
+* **The tilt held too** (`DirectFilter::holdImuCalibration` zeroes gain rows 16-30, not
+  18-30): held without it, the vibration went into the primary base's tilt.
+* **Tracked from arrival** (`LighthouseDirect::OnImu`, `TrackVibration`): in ImuUpdate the
+  0.25 s averages started over with every reset (a new LighthouseDirect), so a filter
+  reset mid-vibration calibrated from the shaking until they caught up. Together with the
+  tilt: 2-6 cm -> under 1 cm off after a synthetic 80-320 Hz vibration; neither alone does it.
+* **No calm calibration while vibrating** (`DeviceTracker::CheckHealth`): one taken then
+  carried the shaking into the next reacquire (1 s hidden mid-vibration: 6-8 mm off after,
+  bias 0.09 m/s2 instead of 0.6 mm and 0.003).
+* **A wrong calibration is never carried** (`LighthouseDirect::CalibrationPlausible`,
+  `DeviceTracker::KeepCalibration`): accel bias, accel scale and gyro bias against the
+  model's factory values (limits 4 m/s2, 0.15, 1 rad/s; recorded healthy devices within
+  0.65 / 0.05 / 0.04, the multi-station captures' fast-swung controller within 3.6 / 0.46
+  / 0.22). One beyond them is never carried into a reacquire or kept as the calm one. What
+  the detector can't see (a tone aliasing near 250 Hz, a DC offset) used to stay for good:
+  255 Hz 10 m/s2 left the device 6.7 m off with the scale 87 % off.
+  Restoring it in place as well was tried and left out: on #90's captures it never helped,
+  and on a young filter (a tracker's gyro bias swings past 1 rad/s while first converging
+  under hard foot motion) restoring to factory froze an unlearnt alignment, and resetting
+  looped.
+
+Tests: `Haptics.*` (tests/runtime), a full DeviceTracker on a synthetic swaying device at
+250 Hz. On upstream's fix alone three fail (VibrationDoesNotGetIntoTheCalibration,
+HiddenWhileVibrating, RecoversFromAWrongCalibration); all pass with these.
+
+#90's bug-report captures, reacquires / resets on the right controller (base / upstream /
+with these): Titanfall 2 session 83/27, 0/0, 0/0; synthetic trigger 1 50/1, 1/0, 0/0 (left
+controller 31/12, 1/1, 0/0); synthetic trigger 2 7/15, 0/1, 0/0. Crab-dance trackers: one
+12/1, 11/2, 7/2, the others unchanged; their trouble is mostly one base's light contradicting
+the pose by 2-11 degrees with a third base learnt from 1 keyframe, not vibration.
+Recorded play: unchanged within one spike (session-1016 > 2 cm spikes 115 / 114 / 116).
+Not verified: the fast-motion captures (fastmotion*, testswing), live hardware.

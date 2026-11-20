@@ -118,6 +118,9 @@ class DeviceTracker {
   void OnAcquired();
   void SyncRoom();
   void CheckHealth();
+  // Carries `f`'s calibration over the next reset if it is sound; one that passes
+  // CalibrationHealthy() but is implausible falls back on the last calm one, else factory.
+  void KeepCalibration(const direct::DirectFilter& f);
   TrackerOutput RawOutput() const;
   void TrackStillness(const ImuSample&);
   void UpdateOutput();
