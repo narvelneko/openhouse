@@ -356,7 +356,11 @@ int main(void) {
         if (pending_scan) { pending_scan = 0; link_rssi_scan(scan_first, reply + 3, 60); reply[2] = ST_OK; pending_reply = 1; }
         usb_service();
         if (pending_action && !pending_reply) { uint8_t a = pending_action; pending_action = 0; do_action(a, reply[3]); }
-        uint32_t period = tud_mounted() ? 1000 : 200;
-        if (ms_ticks % period < period / 10) LED_ON(); else LED_OFF();
+        /* repeater: on, off 0.1 s each second = following the main; 4 Hz blink = searching */
+        const int sat = link_led();
+        uint32_t period = 1000, on = 900;
+        if (sat == 0) { period = 250; on = 125; }
+        else if (sat < 0) { period = tud_mounted() ? 1000 : 200; on = period / 10; }
+        if (ms_ticks % period < on) LED_ON(); else LED_OFF();
     }
 }

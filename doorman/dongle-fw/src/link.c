@@ -1,15 +1,18 @@
 /* openhouse link v1, dongle side (see common/doorman_link.h): slots, joining/pairing, hopping, go-back-N.
- * Everything is polled from the main loop (no radio interrupts).
+ * A main dongle runs everything from the main loop. A repeater dongle receives in the RADIO interrupt, so it
+ * doesn't miss packets while the main loop serves USB.
  *
  * Timers and PPI channels:
  *   TIMER3  1 MHz, free running: the link's microsecond clock. CC[0]: us_now(). CC[1]: the compare that
- *           starts a POLL in timing mode 3. CC[2]: time of the last RADIO ADDRESS. CC[4]: time of the last
- *           RADIO TXREADY.
+ *           starts a POLL in timing mode 3, or a repeater's SREP. CC[2]: time of the last RADIO ADDRESS.
+ *           CC[4]: time of the last RADIO TXREADY.
+ *   TIMER2  counts RADIO END events, so a repeater's interrupt can tell that it ran too late for one.
  *   PPI 0   the amplifier's turnaround (Holyiot only, see fem_*).
  *   PPI 1   TIMER3 CC[1] -> RADIO TXEN; its fork switches the amplifier to TX (Holyiot).
  *   PPI 2   RADIO DISABLED -> RADIO RXEN: receive the answer right after a POLL is sent. It's in PPI group 0,
  *           which its fork disables, so it fires once each time it's armed.
- *   PPI 3   RADIO ADDRESS -> TIMER3 CAPTURE[2].  PPI 7: RADIO TXREADY -> TIMER3 CAPTURE[4]. */
+ *   PPI 3   RADIO ADDRESS -> TIMER3 CAPTURE[2].  PPI 7: RADIO TXREADY -> TIMER3 CAPTURE[4].
+ *   PPI 6   RADIO END -> TIMER2 COUNT. */
 #include <string.h>
 #include "nrf.h"
 #include "doorman_link.h"
@@ -24,7 +27,19 @@
 #include "banks.h"
 
 extern volatile uint32_t ms_ticks;
+/* Code size (the image has to fit the SoftDevice boot stub, ld/stub_sd.ld):
+   KEEP_PTR hides how a pointer was computed, so the compiler keeps it in a register. At -Os it otherwise works
+   out &sl[i] again (sl + i * sizeof, 8 bytes) at every use.
+   GRP_*: variables that share a section are reached through one address (a section anchor). With -fdata-sections
+   every other variable is a section of its own and costs each function that uses it 4 bytes for its address.
+   The big buffers stay out: with them in a group, the offsets no longer fit the short instructions. */
+#define KEEP_PTR(p) __asm__("" : "+r"(p))
+#define GRP_M __attribute__((section(".bss.link_m")))    /* repeaters, main side; timing mode 3 */
+#define GRP_R __attribute__((section(".bss.link_r")))    /* repeater side */
+#define GRP_D __attribute__((section(".data.link")))     /* either, with an initial value */
 static uint32_t us_now(void) { NRF_TIMER3->TASKS_CAPTURE[0] = 1; return NRF_TIMER3->CC[0]; }
+/* us_now() out of line: half the bytes a use, ~0.1 us slower. For where that is fine. */
+static __attribute__((noinline)) uint32_t us_time(void) { return us_now(); }
 
 /* ---------------- paired trackers (persisted in the last app flash page) ---------------- */
 #define PAIR_MAGIC  0x3150484Fu        /* "OHP1": DML_SLOTS slots */
@@ -38,31 +53,57 @@ static uint32_t us_now(void) { NRF_TIMER3->TASKS_CAPTURE[0] = 1; return NRF_TIME
    their way to the host), so a host can tell a device needs an update while it's off. An older page
    ends before them (erased: radios_magic 0xFFFFFFFF) and reads as none known. */
 #define RADIO_MAGIC 0x5652484Fu        /* "OHRV" */
-typedef struct { uint32_t magic, used; uint8_t id[DML_SLOTS][8]; uint32_t names_magic; char name[DML_SLOTS][64];
-                 uint32_t radios_magic; uint32_t radio[DML_SLOTS]; } pair_store_t;
 static int pairs_dirty;                /* a radio version changed: saved from link_poll, not mid-frame */
+#define ROLE_MAGIC  0x4C52484Fu        /* "OHRL" */
+/* The repeater settings (cmd 0x3F) follow the radio versions. Older firmware ignores them, so a repeater that
+   is downgraded keeps its pairings and names and works as a normal dongle. Anything stored after them must
+   come after this block, with a magic of its own. */
+typedef struct {
+  uint32_t rmagic;                     /* ROLE_MAGIC: the fields below are set (else: a main, no repeaters) */
+  uint8_t role;                        /* 0: main (a normal dongle), 1: repeater */
+  uint8_t sat_id;                      /* repeater: its id, 0 or 1 */
+  uint8_t sat_mask;                    /* main: the repeater ids it uses, one bit each */
+  uint8_t rsv;                         /* unused */
+  uint32_t main_base;                  /* repeater: the network base of the main it serves */
+} role_store_t;
+typedef struct {
+  uint32_t magic, used; uint8_t id[DML_SLOTS][8]; uint32_t names_magic; char name[DML_SLOTS][64];
+  uint32_t radios_magic; uint32_t radio[DML_SLOTS];
+  role_store_t r;
+} pair_store_t;
 static pair_store_t pairs;
+/* The repeater ids the main uses (cmd 0x3C). A change applies in RAM at once. It's written to flash
+   (pairs.r.sat_mask) only when the host asks, or once no device is connected: erasing the page stops the CPU
+   for ~85 ms, long enough for connected devices to lose the dongle's hopping. */
+static GRP_M uint8_t sat_on;
 
 static void nvmc_wait(void) { while (!NRF_NVMC->READY) {} }
-typedef struct { uint32_t magic, used; uint8_t id[8][8]; uint32_t names_magic; char name[8][64]; } pair_store8_t;
+/* the 8-slot page; repeater firmware 0x0028 kept its settings right after it */
+typedef struct { uint32_t magic, used; uint8_t id[8][8]; uint32_t names_magic; char name[8][64]; role_store_t r; } pair_store8_t;
 static void pairs_save(void);
 static void pairs_load(void)
 {
   const pair_store8_t *old = (const pair_store8_t *)PAIR_PAGE;
-  if (old->magic == PAIR_MAGIC8) {                          /* 8 slots: same pairings and names, two slots more */
+  const int convert = old->magic == PAIR_MAGIC8;
+  if (convert) {                                            /* 8 slots: same pairings, names and role, two slots more */
     memset(&pairs, 0, sizeof pairs);
     pairs.magic = PAIR_MAGIC; pairs.used = old->used & 0xFF;
     memcpy(pairs.id, old->id, sizeof old->id);
     pairs.names_magic = NAME_MAGIC;
     pairs.radios_magic = RADIO_MAGIC;
     if (old->names_magic == NAME_MAGIC) memcpy(pairs.name, old->name, sizeof old->name);
-    pairs_save();
-    return;
-  }
-  memcpy(&pairs, (const void *)PAIR_PAGE, sizeof pairs);
+    pairs.r = old->r;
+  } else memcpy(&pairs, (const void *)PAIR_PAGE, sizeof pairs);
   if (pairs.magic != PAIR_MAGIC) { memset(&pairs, 0, sizeof pairs); pairs.magic = PAIR_MAGIC; }
   if (pairs.names_magic != NAME_MAGIC) { memset(pairs.name, 0, sizeof pairs.name); pairs.names_magic = NAME_MAGIC; }
   if (pairs.radios_magic != RADIO_MAGIC) { memset(pairs.radio, 0, sizeof pairs.radio); pairs.radios_magic = RADIO_MAGIC; }
+  role_store_t *r = &pairs.r;
+  if (r->rmagic != ROLE_MAGIC || r->role > 1 || r->sat_id >= DML_SAT_MAX) {
+    r->rmagic = ROLE_MAGIC; r->role = 0; r->sat_id = 0; r->sat_mask = 0; r->rsv = 0; r->main_base = 0;
+  }
+  r->sat_mask &= (1u << DML_SAT_MAX) - 1;
+  if (r->role && !r->main_base) r->role = 0;
+  if (convert) pairs_save();
 }
 static void pairs_save(void)
 {
@@ -84,6 +125,8 @@ typedef struct {
   uint8_t last_seq;                     /* last in-order RESP seq (the ack we send) */
   uint8_t dseq, down_len, down_buf[200];
   uint32_t last_resp_ms;
+  uint32_t poll_t;                      /* start time of its last POLL */
+  uint8_t down_sent;                    /* downlink bytes sent and not yet acked: the start of down_buf */
   uint8_t upq[UPQ]; uint16_t up_head, up_tail;
   /* stats */
   uint32_t polls, resp_ok, crc_err, timeouts, dup, frames_up, bytes_up, drops, down_frames, down_resends;
@@ -123,8 +166,6 @@ typedef struct {
      announced mask, period as the device keeps it; [0] valid when g_have), and the polls it missed since */
   uint32_t g_t[2]; uint16_t g_mask[2], g_per[2], g_miss; uint8_t g_cyc[2], g_have;
   uint32_t load_bytes, load_budget;     /* test load (0x2B): filler queued, and owed */   /* raw -dBm; min/max reset on read (0x29) */
-  uint8_t down_sent;                    /* downlink bytes sent and not yet acked: the start of down_buf */
-  uint32_t poll_t;                      /* start time of its last POLL */
 } slot_t;
 static slot_t sl[DML_SLOTS];
 static uint8_t link_on = 1;
@@ -356,6 +397,7 @@ static void fem_turnaround_disarm(void) {}
 #define PPI_LAUNCH 1                   /* TIMER3 COMPARE[1] -> TXEN; fork: amplifier to TX (Holyiot) */
 #define PPI_TURN   2                   /* RADIO DISABLED -> RXEN; fork: disables group 0 (fires once) */
 #define PPI_ADDR   3                   /* RADIO ADDRESS -> TIMER3 CAPTURE[2] */
+#define PPI_ENDCNT 6                   /* RADIO END -> TIMER2 COUNT */
 #define PPI_TXRDY  7                   /* RADIO TXREADY -> TIMER3 CAPTURE[4] */
 #define HX_GROUP   0                   /* PPI group: PPI_TURN (and the amplifier's turnaround, Holyiot) */
 #define CC_LAUNCH  1
@@ -363,6 +405,7 @@ static void fem_turnaround_disarm(void) {}
 #define CC_TXRDY   4
 static void radio_off(void)
 {
+  NRF_RADIO->INTENCLR = 0xFFFFFFFF;                         /* a repeater's receive interrupts */
   NRF_PPI->CHENCLR = 1u << PPI_LAUNCH;                      /* else it fires again when TIMER3 wraps */
   NRF_PPI->TASKS_CHG[HX_GROUP].DIS = 1;
   NRF_RADIO->SHORTS = 0;
@@ -426,9 +469,8 @@ static int hop_of(uint8_t ch) { for (int k = 0; k < DML_NHOP; k++) if (dml_hop_c
 /* Builds slot i's POLL in b (b[0]: length). Its downlink is picked only when nothing is in flight: whole
    frames from down_buf, at most down_max bytes. Until the device acks them, every POLL resends the same bytes,
    and frames queued meanwhile wait for a later POLL. Returns ch's hop index, or -1 for a ghost-follow channel. */
-static int poll_build(uint8_t *b, uint8_t i, uint8_t ch, int down_max)
+static int poll_build(slot_t *s, uint8_t *b, uint8_t i, uint8_t ch, int down_max)
 {
-  slot_t *s = &sl[i];
   uint8_t *p = b + 1;
   int len = DML_POLL_HDR;
   p[0] = DML_POLL; p[1] = i;
@@ -441,71 +483,55 @@ static int poll_build(uint8_t *b, uint8_t i, uint8_t ch, int down_max)
   if (s->down_sent) { p[2] |= DML_F_DOWN; memcpy(p + len, s->down_buf, s->down_sent); len += s->down_sent; }
   b[0] = (uint8_t)len;
   s->polls++;
-  const int hop = ch == cur_ch ? hop_of(cur_ch) : -1;
-  if (ch != cur_ch) ghost_polls++;                          /* ghost polls stay out of the channel statistics */
+  const int hop = ch == cur_ch ? hop_of(ch) : -1;           /* (cur_ch is always a hop channel: -1 only for a ghost) */
   if (hop >= 0) chs[hop].polls++;
+  else ghost_polls++;                                       /* ghost polls stay out of the channel statistics */
   return hop;
 }
-/* Counts a POLL that got no valid answer (n: the receive result; -3 is a CRC error). */
-static void poll_missed(slot_t *s, int n, int hop)
+static void answer_take(slot_t *s, uint8_t i, const uint8_t *r, int n, uint8_t rd, int now);
+static void answer_state(slot_t *s, uint8_t i, const uint8_t *r, uint8_t rd);
+/* The end of slot i's exchange: n bytes received in b (or the receive error; -3 is a CRC error), hop from
+   poll_build. Counts a POLL that got no valid answer, or takes the answer. 1: it answered. */
+static int poll_end(slot_t *s, uint8_t i, const uint8_t *b, int n, int hop)
 {
-  if (n == -3) s->crc_err++; else s->timeouts++;
-  if (hop >= 0) chs[hop].lost++;
-  if (s->active && ms_ticks - s->last_resp_ms > 1000) s->active = 0;
-  if (s->g_miss < 0xFFFF) s->g_miss++;
+  const uint8_t *r = b + 1;
+  if (n < DML_RESP_HDR || r[0] != DML_RESP || r[1] != i) {
+    if (n == -3) s->crc_err++; else s->timeouts++;
+    if (hop >= 0) chs[hop].lost++;
+    if (s->active && ms_ticks - s->last_resp_ms > 1000) s->active = 0;
+    if (s->g_miss < 0xFFFF) s->g_miss++;
+    return 0;
+  }
+  if (hop < 0) ghost_ok++;
+  answer_take(s, i, r, n, (uint8_t)NRF_RADIO->RSSISAMPLE, 1);
+  return 1;
 }
-static int answer_take(uint8_t i, const uint8_t *r, int n, uint8_t rd);
-static int poll_slot(uint8_t i, uint8_t ch, uint32_t t_tx)   /* 1: it answered; ch: cur_ch, or a ghost-follow channel */
+static int poll_slot(slot_t *s, uint8_t i, uint8_t ch, uint32_t t_tx)   /* 1: it answered; ch: cur_ch, or a ghost-follow channel */
 {
-  slot_t *s = &sl[i];
   while (decode_step(s)) {}                                 /* its last answer first: the ack is for it */
-  const int hop = poll_build(pkt_tx, i, ch, 255);
+  const int hop = poll_build(s, pkt_tx, i, ch, 255);
   s->poll_t = t_tx;
   int n = txrx(ch, net_base, (uint8_t)(DML_SLOT_PREFIX + i), 400);
   if (test_drop_pct && n > 0) {                             /* test: lost as if in the air (the device resends) */
     test_rng = test_rng * 1664525u + 1013904223u;
     if ((test_rng >> 16) % 100u < test_drop_pct) n = -2;
   }
-  const uint8_t *r = pkt_rx + 1;
-  if (n < DML_RESP_HDR || r[0] != DML_RESP || r[1] != i) { poll_missed(s, n, hop); return 0; }
-  if (ch != cur_ch) ghost_ok++;
-  return answer_take(i, r, n, (uint8_t)NRF_RADIO->RSSISAMPLE);
+  return poll_end(s, i, pkt_rx, n, hop);
 }
-/* Takes a valid answer (type and slot already checked) from slot i to this cycle's POLL. rd: its signal
-   here in -dBm. */
-static int answer_take(uint8_t i, const uint8_t *r, int n, uint8_t rd)
+/* Takes a valid answer (type and slot already checked) from slot i, heard directly or relayed by a repeater.
+   rd: its signal here in -dBm, 0 if relayed. now: it answers this cycle's POLL (a repeater can also relay one
+   from the cycle before, which only fills the gap in the sequence: the device's hop timing, telemetry and
+   downlink ack are newer than it). */
+static void answer_take(slot_t *s, uint8_t i, const uint8_t *r, int n, uint8_t rd, int now)
 {
-  slot_t *s = &sl[i];
-  s->resp_ok++;
-  s->g_t[1] = s->g_t[0]; s->g_cyc[1] = s->g_cyc[0]; s->g_mask[1] = s->g_mask[0];
-  s->g_per[1] = s->g_have ? s->g_per[0] : 0;               /* 0: no earlier record */
-  s->g_t[0] = s->poll_t; s->g_cyc[0] = cycle; s->g_mask[0] = next_mask;
-  s->g_per[0] = (uint16_t)(period_us / 50 * 50); s->g_have = 1;   /* what the device keeps of p[6] */
-  s->g_miss = 0;
-  s->active = 1; s->last_resp_ms = ms_ticks;
-  if (i == just_paired_slot) just_paired_slot = 0xFF;     /* it joined: its pairing is over, the next one needs pairing open */
-  s->rssi_last_d = rd; s->rssi_last_t = r[3];
-  if (!s->rssi_min_d || rd < s->rssi_min_d) s->rssi_min_d = rd;   /* strongest (smallest -dBm) */
-  if (rd > s->rssi_max_d) s->rssi_max_d = rd;                      /* weakest */
-  s->rssi_d16 = s->rssi_d16 ? s->rssi_d16 - s->rssi_d16 / 16 + rd : (uint32_t)rd * 16;
-  s->rssi_t16 = s->rssi_t16 ? s->rssi_t16 - s->rssi_t16 / 16 + r[3] : (uint32_t)r[3] * 16;
-  if (s->have_tel) { s->t_missed += (uint8_t)(r[4] - s->last_missed); s->t_crc += (uint8_t)(r[5] - s->last_crc); }
-  s->last_missed = r[4]; s->last_crc = r[5]; s->have_tel = 1;
-  uint8_t dack = (r[2] & DML_F_DSEQ) ? 1 : 0;
-  if (s->down_sent) {
-    if (dack == s->dseq) {                                  /* acked: drop the sent bytes, keep what was queued since */
-      s->down_len = (uint8_t)(s->down_len - s->down_sent);
-      memmove(s->down_buf, s->down_buf + s->down_sent, s->down_len);
-      s->down_sent = 0; s->dseq ^= 1;
-    } else s->down_resends++;
-  }
+  if (now) answer_state(s, i, r, rd);
   uint8_t seq = r[2] & DML_F_SEQ_MASK;
   if (seq != ((s->last_seq + 1) & DML_F_SEQ_MASK)) {                          /* duplicate / out of order */
     if (!s->held && seq == ((s->last_seq + 2) & DML_F_SEQ_MASK) && n - DML_RESP_HDR <= DML_MAXLEN) {   /* the one after a lost one */
       s->held = 1; s->held_seq = seq; s->held_n = (uint8_t)(n - DML_RESP_HDR); s->held_set++;
       memcpy(s->held_buf, r + DML_RESP_HDR, s->held_n);
       s->dup_run = 0;
-      return 1;
+      return;
     }
     s->dup++;
     /* Go-back gives one or two of these in a row. A long run means the radio is repeating a seq we
@@ -515,7 +541,7 @@ static int answer_take(uint8_t i, const uint8_t *r, int n, uint8_t rd)
        resets the sequence on both sides. DUP_RUN_LIMIT is well above any loss burst: a lost answer
        is a timeout, not a dup. */
     if (++s->dup_run >= DUP_RUN_LIMIT) { s->dup_run = 0; slot_skip(s); }
-    return 1;
+    return;
   }
   s->dup_run = 0;
   s->last_seq = seq;
@@ -536,29 +562,60 @@ static int answer_take(uint8_t i, const uint8_t *r, int n, uint8_t rd)
     s->held = 0;                                           /* (otherwise stale: the radio went back further) */
   }
   if (!defer_decode) while (decode_step(s)) {}
-  return 1;
+}
+/* What an answer to this cycle's POLL says about the device: it's there, its hop timing, signal, telemetry,
+   and whether it has the downlink in flight. */
+static void answer_state(slot_t *s, uint8_t i, const uint8_t *r, uint8_t rd)
+{
+  s->resp_ok++;
+  s->g_t[1] = s->g_t[0]; s->g_cyc[1] = s->g_cyc[0]; s->g_mask[1] = s->g_mask[0];
+  s->g_per[1] = s->g_have ? s->g_per[0] : 0;               /* 0: no earlier record */
+  s->g_t[0] = s->poll_t; s->g_cyc[0] = cycle; s->g_mask[0] = next_mask;
+  s->g_per[0] = (uint16_t)(period_us / 50 * 50); s->g_have = 1;   /* what the device keeps of p[6] */
+  s->g_miss = 0;
+  s->active = 1; s->last_resp_ms = ms_ticks;
+  if (i == just_paired_slot) just_paired_slot = 0xFF;     /* it joined: its pairing is over, the next one needs pairing open */
+  s->rssi_last_t = r[3];
+  if (rd) {
+    s->rssi_last_d = rd;
+    if (!s->rssi_min_d || rd < s->rssi_min_d) s->rssi_min_d = rd;   /* strongest (smallest -dBm) */
+    if (rd > s->rssi_max_d) s->rssi_max_d = rd;                      /* weakest */
+    s->rssi_d16 = s->rssi_d16 ? s->rssi_d16 - s->rssi_d16 / 16 + rd : (uint32_t)rd * 16;
+  }
+  s->rssi_t16 = s->rssi_t16 ? s->rssi_t16 - s->rssi_t16 / 16 + r[3] : (uint32_t)r[3] * 16;
+  if (s->have_tel) { s->t_missed += (uint8_t)(r[4] - s->last_missed); s->t_crc += (uint8_t)(r[5] - s->last_crc); }
+  s->last_missed = r[4]; s->last_crc = r[5]; s->have_tel = 1;
+  uint8_t dack = (r[2] & DML_F_DSEQ) ? 1 : 0;
+  if (s->down_sent) {
+    if (dack == s->dseq) {                                  /* acked: drop the sent bytes, keep what was queued since */
+      const uint8_t *from = s->down_buf + s->down_sent;
+      const int left = s->down_len - s->down_sent;
+      for (int k = 0; k < left; k++) s->down_buf[k] = from[k];   /* (memmove would add 52 B of libc) */
+      s->down_len = (uint8_t)left; s->down_sent = 0; s->dseq ^= 1;
+    } else s->down_resends++;
+  }
 }
 
 /* ---------------- timing mode 3 (cmd 0x2D): compare-started POLLs ----------------
    The same schedule as mode 1, but the hardware starts each POLL: TIMER3 COMPARE[1] triggers TXEN through
    PPI, and a one-shot PPI link (DISABLED -> RXEN) switches the radio to receive the answer into the same
    buffer. The CPU has no deadline inside an exchange, so it can serve USB while one is on the air. */
-static uint8_t tmode = 3, tmode_req = 3;
+static GRP_D uint8_t tmode = 3, tmode_req = 3;
 #define HX_RAMP_US       40u           /* radio ramp-up, TXEN to TXREADY (fast mode) */
 #define HX_ARM_MIN_US    10            /* a start closer than this is done by software */
 #define HX_DOWN_MAX      64            /* max downlink bytes per POLL (one air-update block) */
 #define HX_PREP_US       30u           /* after an exchange: take the answer, set up the next */
 static uint8_t hx_buf[2 + DML_MAXLEN];
-static uint32_t hx_usb_cost = 100;    /* recent worst idle_hook() (USB) pass, us; decays */
-static uint32_t ex_t_tx;              /* TXREADY time of the last exchange (start + ramp-up) */
+static GRP_D uint32_t hx_usb_cost = 100;    /* recent worst idle_hook() (USB) pass, us; decays */
+static GRP_M uint32_t ex_t_tx;              /* TXREADY time of the last exchange (start + ramp-up) */
 
 /* Prepares one exchange (address and channel already set): send pkt, then receive the answer into it. */
 static void hx_setup(const uint8_t *pkt)
 {
   NRF_RADIO->PACKETPTR = (uint32_t)pkt;
   NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk | RADIO_SHORTS_ADDRESS_RSSISTART_Msk;
-  NRF_RADIO->EVENTS_DISABLED = 0; NRF_RADIO->EVENTS_ADDRESS = 0; NRF_RADIO->EVENTS_END = 0;
-  NRF_RADIO->EVENTS_READY = 0; NRF_RADIO->EVENTS_TXREADY = 0; NRF_RADIO->EVENTS_RXREADY = 0;
+  /* the events hx_txrx reads (DISABLED is cleared where an exchange ends; a main never reads END or READY) */
+  NRF_RADIO->EVENTS_ADDRESS = 0; NRF_RADIO->EVENTS_TXREADY = 0; NRF_RADIO->EVENTS_RXREADY = 0;
   NRF_RADIO->EVENTS_CRCOK = 0; NRF_RADIO->EVENTS_CRCERROR = 0;
   fem_off();
   NRF_PPI->TASKS_CHG[HX_GROUP].EN = 1;                     /* arm the turnaround: DISABLED -> RXEN, once */
@@ -568,13 +625,13 @@ static void hx_setup(const uint8_t *pkt)
    timed or target is too close. Call with interrupts off. Returns the start time. */
 static uint32_t hx_launch(uint32_t target, int timed)
 {
-  if (timed && (int32_t)(target - us_now()) >= HX_ARM_MIN_US) {
+  if (timed && (int32_t)(target - us_time()) >= HX_ARM_MIN_US) {
     NRF_TIMER3->CC[CC_LAUNCH] = target;
     NRF_PPI->CHENSET = 1u << PPI_LAUNCH;
-    if ((int32_t)(target - us_now()) > 0) return target;   /* still ahead of the timer: the compare will fire */
+    if ((int32_t)(target - us_time()) > 0) return target;   /* still ahead of the timer: the compare will fire */
   }
   NRF_PPI->CHENCLR = 1u << PPI_LAUNCH;
-  const uint32_t tstart = us_now();
+  const uint32_t tstart = us_time();
   if (NRF_RADIO->STATE == RADIO_STATE_STATE_Disabled && !NRF_TIMER3->EVENTS_COMPARE[CC_LAUNCH]) {
     fem_tx(); NRF_RADIO->TASKS_TXEN = 1;                   /* the compare didn't fire: start now */
   }
@@ -587,11 +644,11 @@ static void hx_service(uint32_t now, uint32_t next_t, slot_t *s)
   const int32_t left = next_t ? (int32_t)(next_t - now) : 0x7FFFFFFF;
   if (idle_hook && left > (int32_t)(hx_usb_cost + HX_PREP_US)) {
     idle_hook();
-    const uint32_t d = us_now() - now;
+    const uint32_t d = us_time() - now;
     if (d > hx_usb_cost) hx_usb_cost = d > 200 ? 200 : d;   /* longer: a flash write or enumeration */
   }
   /* a frame takes up to ~100 us */
-  if ((int32_t)(next_t ? next_t - us_now() : 0x7FFFFFFF) > (int32_t)(100u + HX_PREP_US))
+  if ((int32_t)(next_t ? next_t - us_time() : 0x7FFFFFFF) > (int32_t)(100u + HX_PREP_US))
     if (!(s && decode_step(s))) decode_some();
 }
 /* Sends hx_buf at target, then receives one answer into hx_buf, serving USB while it waits. Returns the
@@ -612,12 +669,12 @@ static int hx_txrx(uint8_t ch, uint32_t base, uint8_t prefix, uint32_t target, i
   for (;;) {
     /* received; the END -> DISABLE short stops the radio */
     if (NRF_RADIO->EVENTS_CRCOK || NRF_RADIO->EVENTS_CRCERROR) {
-      const uint32_t t = us_now();
-      while (NRF_RADIO->STATE != RADIO_STATE_STATE_Disabled && us_now() - t < 20) {}
+      const uint32_t t = us_time();
+      while (NRF_RADIO->STATE != RADIO_STATE_STATE_Disabled && us_time() - t < 20) {}
       r = NRF_RADIO->EVENTS_CRCOK ? hx_buf[0] : -3;
       break;
     }
-    const uint32_t now2 = us_now();
+    const uint32_t now2 = us_time();
     /* The answer has begun: an ADDRESS after the receiver came up. (The POLL's own ADDRESS is at start + 64 us,
        so one after start + 150 us is the answer's.) */
     if (!rx && NRF_RADIO->EVENTS_RXREADY && NRF_RADIO->EVENTS_ADDRESS &&
@@ -636,17 +693,20 @@ static int hx_txrx(uint8_t ch, uint32_t base, uint8_t prefix, uint32_t target, i
 }
 /* poll_slot() for timing mode 3. Differences: at most HX_DOWN_MAX downlink bytes per POLL, and the slot's
    previous answer is decoded while the exchange is on the air instead of before it. */
-static int poll_slot_hw(uint8_t i, uint8_t ch, uint32_t target, int timed, uint32_t next_t)
+static int poll_slot_hw(slot_t *s, uint8_t i, uint8_t ch, uint32_t target, int timed, uint32_t next_t)
 {
-  slot_t *s = &sl[i];
-  const int hop = poll_build(hx_buf, i, ch, HX_DOWN_MAX);
+  const int hop = poll_build(s, hx_buf, i, ch, HX_DOWN_MAX);
   int n = hx_txrx(ch, net_base, (uint8_t)(DML_SLOT_PREFIX + i), target, timed, next_t, 400, s);
   s->poll_t = ex_t_tx - HX_RAMP_US;
   while (decode_step(s)) {}                                 /* its previous answer first (usually done by now) */
-  const uint8_t *r = hx_buf + 1;
-  if (n < DML_RESP_HDR || r[0] != DML_RESP || r[1] != i) { poll_missed(s, n, hop); return 0; }
-  if (ch != cur_ch) ghost_ok++;
-  return answer_take(i, r, n, (uint8_t)NRF_RADIO->RSSISAMPLE);
+  return poll_end(s, i, hx_buf, n, hop);
+}
+/* One POLL in the timing mode in use: poll_slot_hw(), or poll_slot() at once (t: the time now). Not inlined:
+   it has two callers. */
+static __attribute__((noinline)) int poll_one(uint8_t i, uint8_t ch, uint32_t t, int timed, uint32_t next_t)
+{
+  slot_t *s = &sl[i]; KEEP_PTR(s);
+  return tmode == 3 ? poll_slot_hw(s, i, ch, t, timed, next_t) : poll_slot(s, i, ch, t);
 }
 
 /* ---------------- test load (0x2B) ---------------- */
@@ -922,6 +982,424 @@ static void hop_cycle_start(void)
   }
 }
 
+/* ---------------- repeater dongles (the code calls them satellites: sat_*, sv_*) ----------------
+ * A repeater listens through the whole cycle and keeps every device answer (RESP) it hears. After the device
+ * slots, the main sends each repeater a NEED that lists the answers it missed, and the repeater replies with an
+ * SREP carrying the ones it has. The main takes those through answer_take(), like direct answers, and only if
+ * each is the next in sequence. None of this runs while sat_on is 0 (no repeaters in use). */
+#define TX_ADDR_US     64u             /* TXEN to the packet's ADDRESS: 40 ramp-up + 24 */
+#define SAT_NEED_US    220u            /* cycle time per repeater: a NEED with 8 seqs + set-up */
+#define SAT_WAIT_US    200u            /* NEED end -> SREP ADDRESS wait (it comes at ~124) */
+#define SAT_TAIL_US    60u             /* kept free before the next cycle's first POLL */
+#define SAT_PROC_US    40u             /* to take an SREP's records */
+#define SAT_JOIN_US    700u            /* the join window */
+static int popc(uint32_t v) { int n = 0; for (; v; v &= v - 1) n++; return n; }
+/* RADIO END events so far (TIMER2 counts them) */
+static uint32_t end_count(void) { NRF_TIMER2->TASKS_CAPTURE[0] = 1; return NRF_TIMER2->CC[0]; }
+/* ---- main side ---- */
+static GRP_M uint8_t join_cyc;               /* this cycle ends with a join beacon (decided at its start) */
+/* Each NEED tells the repeater when the next cycle starts, and link_poll starts it then (sat_next_t). */
+static GRP_M uint32_t sat_len;               /* this cycle's planned length: slots, join window, reserve */
+static GRP_M uint32_t sat_next_t;            /* the next start, as the last NEED announced it */
+static GRP_M uint8_t sat_next_ok;            /* sat_next_t is set */
+/* Per repeater: NEEDs that asked for something, SREPs received, answers taken from them, ms_ticks of its
+   last SREP, NEEDs unanswered in a row. */
+typedef struct { uint32_t asks, sreps, acc, last_ms; uint16_t quiet; } satst_t;
+static GRP_M satst_t sats[DML_SAT_MAX];
+/* Per slot: answers relayed with the expected seq, answers taken, and its -dBm at the repeater. */
+static GRP_M struct { uint32_t relayed, acc; uint8_t rssi; } rly[DML_SLOTS];
+/* Writes the repeater ids in use (sat_on) to flash, if they changed. */
+static void sat_save(void) { if (pairs.r.sat_mask != sat_on) { pairs.r.sat_mask = sat_on; pairs_save(); } }
+
+/* The repeater reserve: time added to every cycle while repeaters are in use, whether anything was missed or
+   not. It must stay steady, because a device that misses a POLL keeps hopping on the last period it heard.
+   It covers the NEEDs, plus the part of a full SREP that doesn't fit in the join window. */
+static GRP_M uint32_t sat_r;                 /* the reserve in use; follows sat_reserve() by at most 8 us a cycle */
+#define SAT_ABSENT_N   16              /* NEEDs unanswered in a row: the repeater counts as absent */
+#define SAT_ABSENT_EVERY 16            /* an absent repeater still gets every 16th NEED, to resync if it's back */
+static int sat_absent(int sid) { return sats[sid].quiet >= SAT_ABSENT_N; }
+static uint32_t sat_reserve(void)
+{
+  int n = 0;
+  for (int k = 0; k < DML_SAT_MAX; k++) if ((sat_on >> k) & 1 && !sat_absent(k)) n++;
+  if (!n) return 0;                                         /* no repeater answering: no reserve */
+  const uint32_t one = DML_SREP_TURN_US + 76u + SAT_PROC_US + 4u * (DML_SREP_HDR + DML_SLOTS + 2u + max_resp);
+  const uint32_t idle = SAT_JOIN_US - SAT_TAIL_US;
+  return (uint32_t)n * SAT_NEED_US + (one > idle ? one - idle : 0u);
+}
+/* The slots a repeater listens to next cycle: every planned one, or with more than it can hear, those that
+   lost the most answers lately (loss16: per slot, 16x the share of the last ~16 cycles' POLLs lost). */
+static GRP_M uint16_t loss16[DML_SLOTS];
+static uint16_t sat_listen(uint32_t missed)
+{
+  uint16_t listen = (uint16_t)plan; int n = plan_n;
+  for (int i = 0; i < DML_SLOTS; i++)
+    if ((plan >> i) & 1) loss16[i] = (uint16_t)(loss16[i] - (loss16[i] + 15) / 16 + ((missed >> i) & 1 ? 16 : 0));
+  while (n > DML_SAT_LISTEN) {                              /* drop the least lossy (the highest slot on a tie) */
+    int lo = -1;
+    for (int i = 0; i < DML_SLOTS; i++) if ((listen >> i) & 1 && (lo < 0 || loss16[i] <= loss16[lo])) lo = i;
+    listen &= (uint16_t)~(1u << lo); n--;
+  }
+  return listen;
+}
+/* Sends one NEED to repeater sid at target and takes the answers its SREP relays. want: the slots still
+   missing an answer; listen: the slots it should listen to next cycle; t_next: the next cycle's start; t_lim:
+   the SREP must end by then. Returns the slots whose missing answer was taken. */
+static uint16_t need_one(uint8_t sid, uint16_t want, uint16_t listen, uint32_t target, uint32_t t_next, uint32_t t_lim)
+{
+  satst_t *st = &sats[sid];
+  /* At least 20 us ahead, so the compare starts it (unless building the NEED takes more than 10 us). */
+  const uint32_t soon = us_time() + 20;
+  if ((int32_t)(target - soon) < 0) target = soon;
+  int len = DML_NEED_HDR + popc(want);
+  const uint32_t t_end = target + HX_RAMP_US + 4u * (9u + (uint32_t)len);
+  const int32_t room = (int32_t)(t_lim - t_end) - (int32_t)SAT_PROC_US;
+  /* SREP bytes: 4 us each after 76 us ramp-up and framing (negative: no room at all) */
+  int cap = (room - (int32_t)(DML_SREP_TURN_US + 76)) >> 2;
+  if (cap > DML_MAXLEN) cap = DML_MAXLEN;
+  /* No room for a useful SREP (one small answer; that's 260 us of room, more than the SAT_WAIT_US the main waits
+     for one): the NEED still goes out (it carries the next cycle's timing), asking for nothing. */
+  if (cap < DML_SREP_HDR + DML_SLOTS + 2 + DML_RESP_HDR + 8) { want = 0; cap = 0; len = DML_NEED_HDR; }
+  uint8_t *p = hx_buf + 1;
+  uint32_t to_next = t_next - (target + TX_ADDR_US);
+  const uint8_t late = (int32_t)to_next <= 0 || to_next > 0xFFFFu;   /* this cycle overran: no next start to announce */
+  if (late) to_next = 0;
+  p[0] = DML_NEED; p[1] = sid; p[2] = (uint8_t)(cycle + 1); p[3] = (uint8_t)next_mask; p[4] = (uint8_t)(next_mask >> 8);
+  p[5] = (uint8_t)(sat_len / 50);                          /* this cycle's length: the repeater's estimate */
+  p[6] = (uint8_t)to_next; p[7] = (uint8_t)(to_next >> 8);
+  p[8] = (uint8_t)listen; p[9] = (uint8_t)(listen >> 8); p[10] = (uint8_t)want; p[11] = (uint8_t)(want >> 8);
+  p[12] = (uint8_t)cap; p[13] = late ? DML_NEED_F_NOSTART : 0;
+  int k = DML_NEED_HDR;
+  for (uint8_t i = 0; i < DML_SLOTS; i++) if ((want >> i) & 1) p[k++] = (uint8_t)((sl[i].last_seq + 1) & DML_F_SEQ_MASK);
+  hx_buf[0] = (uint8_t)len;
+  if (want) st->asks++;
+  const int n = hx_txrx(cur_ch, DML_SAT_BASE(net_base), (uint8_t)(DML_SAT_PREFIX + sid), target, 1, t_next,
+                        want ? SAT_WAIT_US : 30u, 0);   /* nothing wanted: no reply, wait 30 us past the end */
+  if (!want) return 0;
+  const uint8_t *r = hx_buf + 1;
+  if (n < DML_SREP_HDR || r[0] != DML_SREP || r[1] != sid || r[2] != cycle) { if (st->quiet < 0xFFFF) st->quiet++; return 0; }
+  st->quiet = 0; st->sreps++; st->last_ms = ms_ticks;
+  const uint16_t heard = (uint16_t)(r[3] | r[4] << 8);
+  int q = DML_SREP_HDR;
+  for (uint8_t i = 0; i < DML_SLOTS; i++) if ((heard >> i) & 1) { rly[i].rssi = q < n ? r[q] : 0; q++; }
+  uint16_t got = 0;
+  const int hop = hop_of(cur_ch);                           /* (>= 0: cur_ch is always a hop channel) */
+  while (q + 2 <= n) {                                      /* records [slot, 0x80: from the cycle before][len][RESP] */
+    const uint8_t i = r[q] & 0x7F, rl = r[q + 1], now = !(r[q] & 0x80);
+    const uint8_t *rp = r + q + 2;
+    q += 2 + rl;
+    if (q > n) break;
+    /* (the repeater keeps only RESPs, each under its own slot: no need to check rp[0] and rp[1] again) */
+    if (i >= DML_SLOTS || !((want >> i) & 1) || rl < DML_RESP_HDR) continue;
+    slot_t *s = &sl[i]; KEEP_PTR(s);
+    /* The expected seq (it goes on, and so does a held one after it), or the one after it (kept, as a selective
+       ack: the POLL then asks the device for the missing one only). Anything else is old. */
+    const uint8_t d = (uint8_t)((rp[2] - s->last_seq) & DML_F_SEQ_MASK);
+    if (d != 1 && !(d == 2 && !s->held)) continue;
+    rly[i].relayed++;
+    while (decode_step(s)) {}                                /* its previous answer first, to keep frames in order */
+    if (slot_skipping(s)) continue;                          /* that answer made the slot rejoin: drop this one */
+    answer_take(s, i, rp, rl, 0, now);                       /* d 1: taken; d 2: kept, the slot still lacks its answer */
+    st->acc++; rly[i].acc++;
+    if (d == 1) got |= (uint16_t)(1u << i);
+    if (now && chs[hop].lost) chs[hop].lost--;   /* this cycle's answer came after all: not lost on this channel */
+  }
+  return got;
+}
+/* After the device slots: one NEED to each repeater in use (the second asks only for what the first didn't
+   deliver), then the join beacon if it's due and fits; otherwise it waits for the next cycle. Returns 1 if the
+   beacon was sent. */
+static int need_round(uint16_t want, uint16_t listen, uint32_t target, uint32_t t_plan)
+{
+  const uint32_t t_next = t_c + sat_len;
+  sat_next_t = t_next; sat_next_ok = 1;
+  /* A due beacon normally gives way to the NEEDs and moves to the next cycle. After 40 ms without one (twice
+     its interval), its window is kept free first. */
+  const int join_force = ms_ticks - last_join_ms >= 40;
+  const uint32_t t_lim = t_next - SAT_TAIL_US - (join_force ? SAT_JOIN_US : 0u);
+  const uint32_t last_start = t_lim - (uint32_t)popc(sat_on) * SAT_NEED_US;   /* latest start that fits all NEEDs */
+  /* The NEEDs were pushed back to wait out a late answer from the last slot and no longer fit: none this
+     cycle, rather than send over that answer. */
+  const int skip = (int32_t)(target - last_start) > 0 && (int32_t)(target - t_plan) > 0;
+  uint8_t ask = 0;
+  for (uint8_t sid = 0; sid < DML_SAT_MAX; sid++)
+    /* absent: every 16th cycle */
+    if ((sat_on >> sid) & 1 && !(sat_absent(sid) && (cycle % SAT_ABSENT_EVERY))) ask |= (uint8_t)(1u << sid);
+  for (uint8_t sid = 0; sid < DML_SAT_MAX && !skip; sid++) {
+    if (!((ask >> sid) & 1)) continue;
+    const uint32_t later = (uint32_t)popc(ask >> (sid + 1)) * SAT_NEED_US;   /* room for the NEEDs after this one */
+    want &= (uint16_t)~need_one(sid, want, listen, target, t_next, t_lim - later);
+    target = us_time();
+  }
+  if (join_cyc || join_force) {
+    if ((int32_t)(t_next - us_time()) >= (int32_t)SAT_JOIN_US) {
+      wait_until(t_next - SAT_JOIN_US);
+      last_join_ms = ms_ticks; join_beacon();
+      return 1;
+    }
+  }
+  return 0;                                                 /* no room: next cycle (join_cyc stays set) */
+}
+
+/* ---- repeater side ----
+   All radio work happens in the RADIO interrupt, which has priority over USB. sat_poll (its link_poll) only
+   moves to the next cycle when no NEED came, and restarts after timeouts. */
+/* SP_RX listening; SP_RETUNE stopping to change channel; SP_TXWAIT stopping the receiver for an SREP;
+   SP_TXON SREP armed or on the air. */
+enum { SP_OFF, SP_RX, SP_RETUNE, SP_TXWAIT, SP_TXON };
+static GRP_R volatile uint8_t sp_phase;
+static GRP_M uint8_t role_run, sv_started;   /* the role running; the repeater has started */
+static uint8_t sr_buf[2][2 + DML_MAXLEN], sr_tx[2 + DML_MAXLEN];   /* 2 receive buffers in turn; the SREP */
+static GRP_R uint8_t sr_cur;           /* the receive buffer in use */
+/* The last two RESPs heard from each slot ([0] the newer), tagged with their cycle and ms_ticks. A NEED is
+   answered from those of its cycle and the one before (no older: one could carry the expected 3-bit seq and be
+   another answer). The older one fills a gap the main keeps a later answer behind (DML_F_SACK). */
+typedef struct { uint8_t valid, rssi, cyc; uint32_t ms; uint8_t b[2 + DML_MAXLEN]; } kept_t;
+static kept_t kept[DML_SLOTS][2];
+static GRP_R uint32_t sv_endc;               /* END count at the last interrupt (+2: one was missed) */
+static GRP_R volatile uint8_t sv_search;  /* 1: looking for the main's JOIN beacon (ch 80); sv_begin starts with it */
+static GRP_R uint8_t sv_cyc, sv_ch;          /* the main's cycle, its channel */
+static GRP_R uint16_t sv_listen;              /* the slots the main asked us to listen to (NEED listen) */
+static GRP_R uint16_t sv_cmask, sv_nmask;   /* channel mask of this cycle and the next (from the JOIN beacon on) */
+/* Keeping time. A POLL's period field is the time from the previous cycle's start to this one's, in 50 us
+   steps. Only a NEED gives the exact time to the next start; without one the repeater coasts on its estimate. */
+static GRP_D uint32_t sv_period = 6000;      /* estimate of the time from this cycle's start to the next's */
+static GRP_R uint32_t sv_tcs, sv_tprev;      /* this cycle's start (estimated), the previous one's */
+static GRP_R uint8_t sv_exact, sv_p50;       /* sv_tcs came from a NEED/JOIN; sv_period's period field */
+static GRP_R volatile uint32_t sv_heard_ms, sv_isr_ms;   /* ms_ticks when the main was last heard; of the last interrupt */
+static GRP_R uint32_t sv_cycles, sv_needs, sv_sreps;     /* status counters (cmd 0x3D) */
+static GRP_R uint8_t sv_coast_run;           /* cycles in a row without a NEED */
+#define SV_COAST_MAX 64                /* then resync from the JOIN beacon (every ~20 ms) */
+static GRP_R uint32_t sv_heard[DML_SLOTS];                 /* RESPs heard per slot */
+static GRP_R uint16_t sv_rssi16[DML_SLOTS], sv_mrssi16;    /* -dBm x16, smoothed: per slot, and of the main */
+
+static void sv_rssi(uint16_t *a, uint8_t v) { *a = *a ? (uint16_t)(*a - *a / 16 + v) : (uint16_t)(v * 16); }
+/* With the radio disabled: listen on this cycle's channel, or for the JOIN beacon while searching. */
+static void sv_rx_start(void)
+{
+  NRF_RADIO->SHORTS = 0;
+  uint32_t pw[2] = { DML_JOIN_PREFIX, 0 }, base = DML_JOIN_BASE, rxa = 1;   /* PREFIX0 and 1: logical addresses 0-7 */
+  uint8_t ch = DML_JOIN_CHANNEL;
+  if (!sv_search) {
+    /* Logical address 0 is our own, for NEEDs. 1-7 are device slots on the main's network: the planned ones
+       first, then the rest (devices that may join). The radio has 8, so with 8 devices one slot isn't heard. */
+    ch = dml_channel(sv_cyc, sv_cmask);
+    base = DML_SAT_BASE(pairs.r.main_base); NRF_RADIO->BASE1 = pairs.r.main_base;
+    uint8_t *pf = (uint8_t *)pw;
+    pf[0] = (uint8_t)(DML_SAT_PREFIX + pairs.r.sat_id);
+    int k = 1;
+    uint16_t m = sv_listen;
+    for (int pass = 0; pass < 2; pass++, m = (uint16_t)~m)
+      for (int i = 0; i < DML_SLOTS && k < 8; i++) if ((m >> i) & 1) pf[k++] = (uint8_t)(DML_SLOT_PREFIX + i);
+    rxa = 0xFF;
+  }
+  NRF_RADIO->FREQUENCY = sv_ch = ch;
+  NRF_RADIO->BASE0 = base; NRF_RADIO->PREFIX0 = pw[0]; NRF_RADIO->PREFIX1 = pw[1];
+  NRF_RADIO->RXADDRESSES = rxa;
+  sv_endc = end_count();
+  NRF_RADIO->PACKETPTR = (uint32_t)sr_buf[0]; sr_cur = 0;   /* this START uses buffer 0; READY points at 1 */
+  NRF_RADIO->EVENTS_READY = 0; NRF_RADIO->EVENTS_END = 0; NRF_RADIO->EVENTS_DISABLED = 0;
+  NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_START_Msk | RADIO_SHORTS_ADDRESS_RSSISTART_Msk;
+  sp_phase = SP_RX;
+  fem_rx();
+  NRF_RADIO->TASKS_RXEN = 1;
+}
+/* Stops the receiver; the DISABLED interrupt then starts it on the current channel (sv_rx_start). */
+static void sv_retune(void)
+{
+  NRF_RADIO->SHORTS = 0;
+  sp_phase = SP_RETUNE;
+  NRF_RADIO->TASKS_DISABLE = 1;
+}
+/* A packet of this cycle heard at ta, so the cycle can't end before ta + 500 us. Coasting on the period from
+   the POLLs (rounded to 50 us) drifts; this moves an end estimated too early back. */
+static void sv_seen(uint32_t ta)
+{
+  if ((int32_t)(ta + 500u - (sv_tcs + sv_period)) > 0) sv_tcs = ta + 500u - sv_period;
+}
+/* The exact period is the time between one slot's POLLs in consecutive cycles (the announced one is rounded
+   down to 50 us). The last POLL heard per slot: */
+static GRP_R struct { uint32_t t; uint8_t cyc, per50; } sv_lp[DML_SLOTS];
+/* A POLL to slot k heard at ta: take the cycle, the next channel mask and the period from it. */
+static void sv_poll_heard(uint8_t k, uint8_t cyc, uint16_t nm, uint8_t per50, uint8_t rssi, uint32_t ta)
+{
+  sv_heard_ms = ms_ticks; sv_rssi(&sv_mrssi16, rssi);
+  const uint32_t est = per50 * 50u + 25u;                  /* mid-step: the main rounds down */
+  if (cyc != sv_cyc) {                                      /* another cycle on our channel: follow it */
+    for (int i = 0; i < DML_SLOTS; i++) kept[i][0].valid = kept[i][1].valid = 0;   /* the kept RESPs are another cycle's */
+    sv_cyc = cyc; sv_tcs = ta - TX_ADDR_US; sv_tprev = sv_tcs - est; sv_exact = 0;   /* as if it were the first POLL */
+  } else if (!sv_exact && per50 && per50 != sv_p50) sv_tcs = sv_tprev + est;   /* period changed while coasting */
+  sv_nmask = nm;
+  if (per50) {
+    const uint32_t dt = ta - sv_lp[k].t;                    /* one cycle later: exact if nothing changed */
+    if ((uint8_t)(sv_lp[k].cyc + 1) == cyc && sv_lp[k].per50 == per50 && dt - est + 26u <= 52u) sv_period = dt;   /* est +- 26 */
+    else if (per50 != sv_p50) sv_period = est;
+    sv_p50 = per50;
+    sv_lp[k].t = ta; sv_lp[k].cyc = cyc; sv_lp[k].per50 = per50;
+  }
+  sv_seen(ta);
+}
+/* Slot i's kept RESP of cycle cyc, if any. */
+static const kept_t *kept_of(int i, uint8_t cyc)
+{
+  for (int e = 0; e < 2; e++) {
+    const kept_t *x = &kept[i][e]; KEEP_PTR(x);
+    if (x->valid && x->cyc == cyc && ms_ticks - x->ms < 40) return x;   /* (40 ms: no stale one from a wrapped cycle) */
+  }
+  return 0;
+}
+/* A NEED for us: arms the SREP if anything is wanted, then takes the next cycle's number, mask and start
+   from it. Returns 1 if the SREP is armed, 0 to retune for the next cycle. */
+static int sv_need(const uint8_t *p, int n, uint8_t rssi, uint32_t ta)
+{
+  sv_needs++; sv_heard_ms = ms_ticks; sv_rssi(&sv_mrssi16, rssi);
+  const uint16_t want = (uint16_t)(p[10] | p[11] << 8);
+  const uint8_t cap = p[12] > DML_MAXLEN ? DML_MAXLEN : p[12];   /* no more than sr_tx holds */
+  int armed = 0;
+  if (want) {
+    uint8_t *q = sr_tx + 1;
+    uint16_t heard = 0;
+    const uint8_t cyc = (uint8_t)(p[2] - 1);               /* the cycle the NEED is about */
+    int len = DML_SREP_HDR, k = DML_NEED_HDR;
+    for (int i = 0; i < DML_SLOTS; i++) {
+      const kept_t *e = kept_of(i, cyc);
+      if (e) { heard |= (uint16_t)(1u << i); q[len++] = e->rssi; }
+    }
+    q[0] = DML_SREP; q[1] = pairs.r.sat_id; q[2] = sv_cyc; q[3] = (uint8_t)heard; q[4] = (uint8_t)(heard >> 8);   /* the main checks the cycle */
+    for (int i = 0; i < DML_SLOTS; i++) {
+      if (!((want >> i) & 1)) continue;
+      if (k >= n) break;
+      const uint8_t exp = p[k++] & DML_F_SEQ_MASK;
+      for (int m = 0; m < 2; m++) {                         /* the expected answer, then the one after it */
+        const uint8_t ws = (uint8_t)((exp + m) & DML_F_SEQ_MASK);
+        const kept_t *e = 0;
+        int old = 0;                                        /* from this cycle, or else (1) from the one before */
+        for (; old < 2; old++) { e = kept_of(i, (uint8_t)(cyc - old)); if (e && (e->b[1 + 2] & DML_F_SEQ_MASK) == ws) break; }
+        if (old == 2) continue;
+        const uint8_t rl = e->b[0];
+        if (len + 2 + rl > cap) break;
+        q[len++] = (uint8_t)(i | old << 7); q[len++] = rl; memcpy(q + len, e->b + 1, rl); len += rl;
+      }
+    }
+    sr_tx[0] = (uint8_t)len;
+    const uint32_t t_tx = ta + 4u * (3u + (uint32_t)n) + DML_SREP_TURN_US;   /* NEED end + turnaround */
+    if ((int32_t)(t_tx - us_now()) > HX_ARM_MIN_US && len <= cap) {
+      NRF_RADIO->SHORTS = 0;
+      NRF_RADIO->TASKS_DISABLE = 1;
+      NRF_RADIO->PACKETPTR = (uint32_t)sr_tx; NRF_RADIO->TXADDRESS = 0;
+      NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk;
+      fem_off();                                            /* PPI_LAUNCH's fork sets the amplifier to TX (Holyiot) */
+      NRF_TIMER3->EVENTS_COMPARE[CC_LAUNCH] = 0;
+      NRF_TIMER3->CC[CC_LAUNCH] = t_tx;
+      NRF_PPI->CHENSET = 1u << PPI_LAUNCH;
+      if ((int32_t)(t_tx - us_now()) > 0) { sp_phase = SP_TXWAIT; sv_sreps++; armed = 1; }
+      else { NRF_PPI->CHENCLR = 1u << PPI_LAUNCH; sp_phase = SP_RETUNE; }   /* start passed while arming: no SREP */
+    }
+  }
+  /* The next cycle: number, channel mask and start; listen to the planned slots first. */
+  sv_cyc = p[2]; sv_cmask = sv_nmask = (uint16_t)(p[3] | p[4] << 8);
+  const int nostart = p[13] & DML_NEED_F_NOSTART;           /* main's cycle overran: next one starts now */
+  const uint32_t tn = nostart ? ta + 4u * (3u + (uint32_t)n) + 300u : ta + (uint32_t)(p[6] | p[7] << 8);
+  if (p[5] && p[5] != sv_p50) { sv_period = p[5] * 50u + 25u; sv_p50 = p[5]; }
+  sv_tprev = sv_tcs; sv_tcs = tn; sv_exact = !nostart;
+  sv_listen = (uint16_t)(p[8] | p[9] << 8);
+  sv_cycles++; sv_coast_run = 0;
+  return armed;
+}
+void RADIO_IRQHandler(void)                                 /* repeaters only: a main never sets INTEN */
+{
+  sv_isr_ms = ms_ticks;
+  if (NRF_RADIO->EVENTS_READY) {
+    NRF_RADIO->EVENTS_READY = 0;
+    /* START took buffer 0; the next packet uses 1 */
+    if (sp_phase == SP_RX) NRF_RADIO->PACKETPTR = (uint32_t)sr_buf[1];
+  }
+  if (NRF_RADIO->EVENTS_END) {
+    NRF_RADIO->EVENTS_END = 0;
+    if (sp_phase == SP_RX) {
+      uint8_t *b = sr_buf[sr_cur];
+      const uint8_t crc = (uint8_t)NRF_RADIO->CRCSTATUS, la = (uint8_t)NRF_RADIO->RXMATCH, rssi = (uint8_t)NRF_RADIO->RSSISAMPLE;
+      const uint32_t ta = NRF_TIMER3->CC[CC_ADDR];
+      int act = -1;                                         /* -1 keep listening, 0 retune, 1 SREP armed */
+      const int n = b[0] > DML_MAXLEN ? DML_MAXLEN : b[0];
+      const uint8_t *p = b + 1;
+      const uint32_t ec = end_count();
+      const int late = ec - sv_endc > 1;                    /* ran after the next END too: its CRC etc. */
+      sv_endc = ec;
+      if (late || !crc) {}                                  /* drop it */
+      else if (sv_search) {
+        uint32_t nb; memcpy(&nb, p + 1, 4);
+        if (n >= DML_JOIN_LEN && p[0] == DML_JOIN && nb == pairs.r.main_base) {
+          sv_cyc = (uint8_t)(p[17] + 1); sv_cmask = sv_nmask = (uint16_t)(p[15] | p[16] << 8);
+          if (p[18]) { sv_period = p[18] * 50u + 25u; sv_p50 = p[18]; }
+          sv_tcs = ta + SAT_JOIN_US - TX_ADDR_US;           /* next cycle: 700 us after the beacon */
+          sv_tprev = sv_tcs - sv_period; sv_exact = 1;
+          sv_search = 0; sv_heard_ms = ms_ticks; sv_rssi(&sv_mrssi16, rssi);
+          act = 0;
+        }
+      } else if (la == 0) {
+        if (n >= DML_NEED_HDR && p[0] == DML_NEED && p[1] == pairs.r.sat_id) act = sv_need(p, n, rssi, ta);
+      } else if (p[0] == DML_RESP && n >= DML_RESP_HDR && p[1] < DML_SLOTS) {
+        kept_t *e = kept[p[1]]; KEEP_PTR(e);
+        if (e[0].valid && e[0].cyc != sv_cyc) e[1] = e[0];  /* (a second RESP in the same cycle replaces the first) */
+        e[0].valid = 1; e[0].rssi = rssi; e[0].cyc = sv_cyc; e[0].ms = ms_ticks; memcpy(e[0].b, b, (size_t)n + 1);
+        sv_heard[p[1]]++; sv_rssi(&sv_rssi16[p[1]], rssi); sv_heard_ms = ms_ticks;
+        sv_seen(ta);
+      } else if (p[0] == DML_POLL && n >= DML_POLL_HDR && p[1] < DML_SLOTS) sv_poll_heard(p[1], p[3], (uint16_t)(p[4] | p[5] << 8), p[6], rssi, ta);
+      if (act == 0) sv_retune();
+      else if (act < 0) { NRF_RADIO->PACKETPTR = (uint32_t)b; sr_cur ^= 1; }   /* for the packet after the next one */
+    }
+  }
+  if (NRF_RADIO->EVENTS_DISABLED) {
+    NRF_RADIO->EVENTS_DISABLED = 0;
+    const uint8_t ph = sp_phase;
+    if (ph == SP_TXWAIT) sp_phase = SP_TXON;               /* receiver off: the compare starts the SREP */
+    else if (ph != SP_OFF) {                                /* SREP sent, retune, or the receiver stopped: listen */
+      if (ph == SP_TXON) { NRF_PPI->CHENCLR = 1u << PPI_LAUNCH; fem_off(); }
+      sv_rx_start();
+    }
+  }
+  (void)NRF_RADIO->EVENTS_DISABLED;
+}
+static void sv_begin(void)   /* (re)start the repeater: look for the main's JOIN beacon */
+{
+  radio_off();
+  sp_phase = SP_OFF;
+  /* TinyUSB stops the crystal when VBUS drops (a weak charger), and the radio needs it */
+  if (!(NRF_CLOCK->HFCLKSTAT & CLOCK_HFCLKSTAT_SRC_Msk)) NRF_CLOCK->TASKS_HFCLKSTART = 1;
+  sv_search = 1; sv_started = 1; sv_listen = 0;
+  sv_heard_ms = sv_isr_ms = ms_ticks;
+  __disable_irq();
+  sv_rx_start();                                            /* clears the three events: no interrupt for an old one */
+  NRF_RADIO->INTENSET = RADIO_INTENSET_READY_Msk | RADIO_INTENSET_END_Msk | RADIO_INTENSET_DISABLED_Msk;
+  __enable_irq();
+}
+/* link_poll for a repeater. It never blocks, so it runs without a USB host. Moves to the next cycle when no
+   NEED came, and goes back to the JOIN beacon after 1 s without hearing the main. */
+static void sat_poll(void)
+{
+  /* No radio interrupt for 3 s: start over. Compared signed, because the interrupt can set sv_isr_ms to a
+     newer tick than the ms_ticks read just before it. */
+  if (!sv_started || (int32_t)(ms_ticks - sv_isr_ms) > 3000) sv_begin();
+  __disable_irq();
+  /* an SREP that never finished */
+  if (sp_phase >= SP_TXWAIT && (int32_t)(us_time() - sv_tcs) > 3000) {   /* (SP_TXWAIT or SP_TXON) */
+    NRF_PPI->CHENCLR = 1u << PPI_LAUNCH;
+    if (NRF_RADIO->STATE == RADIO_STATE_STATE_Disabled) sv_rx_start(); else sv_retune();
+  }
+  if (sp_phase == SP_RX && !sv_search) {
+    if (ms_ticks - sv_heard_ms > 1000) { sv_search = 1; sv_retune(); }
+    /* just before the next start (its ADDRESS: +64) */
+    else if ((int32_t)(us_time() - (sv_tcs + sv_period - 60u)) > 0) {
+      sv_cyc++; sv_cmask = sv_nmask; sv_tprev = sv_tcs; sv_tcs += sv_period; sv_exact = 0; sv_cycles++;
+      if (++sv_coast_run >= SV_COAST_MAX) { sv_coast_run = 0; sv_search = 1; }   /* no NEEDs: resync from the beacon */
+      sv_retune();
+    }
+  }
+  __enable_irq();
+}
+int link_led(void) { return role_run ? !sv_search : -1; }    /* for main.c's LED, see link.h */
+
 /* ---------------- main-loop entry points ---------------- */
 void link_init(void)
 {
@@ -961,8 +1439,14 @@ void link_init(void)
   NRF_PPI->CH[PPI_ADDR].TEP = (uint32_t)&NRF_TIMER3->TASKS_CAPTURE[CC_ADDR];
   NRF_PPI->CH[PPI_TXRDY].EEP = (uint32_t)&NRF_RADIO->EVENTS_TXREADY;
   NRF_PPI->CH[PPI_TXRDY].TEP = (uint32_t)&NRF_TIMER3->TASKS_CAPTURE[CC_TXRDY];
-  NRF_PPI->CHENSET = 1u << PPI_ADDR | 1u << PPI_TXRDY;
-  pairs_load();
+  NRF_TIMER2->TASKS_STOP = 1; NRF_TIMER2->MODE = 2; NRF_TIMER2->BITMODE = 3;   /* RADIO END counter */
+  NRF_TIMER2->TASKS_CLEAR = 1; NRF_TIMER2->TASKS_START = 1;
+  NRF_PPI->CH[PPI_ENDCNT].EEP = (uint32_t)&NRF_RADIO->EVENTS_END;
+  NRF_PPI->CH[PPI_ENDCNT].TEP = (uint32_t)&NRF_TIMER2->TASKS_COUNT;
+  NVIC_SetPriority(RADIO_IRQn, 1);                          /* above USBD (2), below SysTick (0) */
+  NVIC_ClearPendingIRQ(RADIO_IRQn); NVIC_EnableIRQ(RADIO_IRQn);   /* a main never sets INTEN: no interrupts */
+  NRF_PPI->CHENSET = 1u << PPI_ADDR | 1u << PPI_TXRDY | 1u << PPI_ENDCNT;
+  pairs_load(); sat_on = pairs.r.sat_mask;
   for (int i = 0; i < DML_SLOTS; i++) { sl[i].last_seq = 7; sl[i].dseq = 0; }
 }
 
@@ -970,7 +1454,10 @@ void link_poll(void)
 {
   load_tick();
   if (pairs_dirty) { pairs_dirty = 0; pairs_save(); }
-  if (!link_on) { radio_off(); return; }
+  if (!link_on) { radio_off(); sv_started = 0; return; }
+  /* role changed (0x3F): restart in it */
+  if (role_run != pairs.r.role) { radio_off(); role_run = pairs.r.role; sv_started = 0; }
+  if (role_run) { sat_poll(); return; }                     /* a repeater never sends a JOIN or POLL */
   tmode = tmode_req; adaptive = tmode & 1;                  /* a mode change (0x2D) applies here */
   const int hw = tmode == 3;
   /* TDMA plan, rebuilt each cycle from the connected slots: the k-th polled at t_c + k*slot_us, then the
@@ -993,8 +1480,8 @@ void link_poll(void)
   /* The cycle goes out as one byte of 50 us (POLL p[6], JOIN p[18]): 12.75 ms at most. Nine or ten devices with
      large answers made it longer, the byte wrapped, and every device hopped on a wrong clock and missed polls.
      So with many devices the answers stay short enough for it: 10 -> 188 B, 9 -> 222 B, 8 or fewer unchanged. */
-  if (n) {
-    const int cap = (int)(((PERIOD_MAX_US - 700u) / (uint32_t)n - 450u) / 4u);
+  if (n) {                                                  /* (and the repeater reserve, when in use) */
+    const int cap = (int)(((PERIOD_MAX_US - 700u - sat_r) / (uint32_t)n - 450u) / 4u);
     if (max_resp > cap) max_resp = (uint8_t)cap;
   }
   /* Each slot's share of the cycle: what the slowest exchange of the last 32 cycles took plus a guard,
@@ -1002,12 +1489,26 @@ void link_poll(void)
      rarely full, so the cycle is shorter and every device is polled more often. Off: cmd 0x2D 0. */
   const uint32_t worst = 450u + 4u * max_resp;
   slot_us = adaptive && ex_budget ? (ex_budget + SLOT_GUARD_US < worst ? ex_budget + SLOT_GUARD_US : worst) : worst;
+  const int sat = sat_on || sat_r;                          /* once per cycle: the mask command can run mid-cycle */
   /* The join window (700 us) only in the cycles that send a JOIN beacon (every 20 ms): every cycle kept
      it, and at a 4.5 ms cycle three in four carried 700 us of nothing (15% of the cycle, longer between
      each device's polls). The others end JOIN_TAIL_US after their last slot. Radios take the period from
-     each POLL and find their polls by address, so cycles of two lengths are no trouble to them. */
+     each POLL and find their polls by address, so cycles of two lengths are no trouble to them. With
+     repeaters every cycle keeps it: their SREPs use it, and the cycle has to stay steady (sat_reserve). */
   const int join = ms_ticks - last_join_ms >= 20;
-  period_us = n * slot_us + (join || test_join_always ? 700u : JOIN_TAIL_US);
+  period_us = n * slot_us + (sat || join || test_join_always ? 700u : JOIN_TAIL_US);
+  /* no device connected: safe to save */
+  if (!plan) sat_save();
+  if (sat) {                                                /* repeaters in use: room for NEEDs and SREPs */
+    join_cyc = join_cyc || ms_ticks - last_join_ms + (period_us + 999u) / 1000u >= 20u;
+    const uint32_t want_r = sat_reserve();                  /* by <= 8 us a cycle, so devices don't drift */
+    sat_r = want_r > sat_r + 8u ? sat_r + 8u : want_r + 8u < sat_r ? sat_r - 8u : want_r;
+    /* at most PERIOD_MAX_US: the POLL sends period/50 in a byte (period_us alone is within it: max_resp's cap) */
+    sat_len = period_us + sat_r <= PERIOD_MAX_US ? period_us + sat_r : PERIOD_MAX_US;
+    const uint32_t pr = sat_next_t - t_c;                   /* keep the start the last NEED announced */
+    if (sat_next_ok && pr > 0 && pr <= PERIOD_MAX_US) period_us = cycle_len = pr;
+    else period_us = sat_len;
+  } else sat_next_ok = 0;
   t_c += cycle_len;                                         /* the previous cycle's own length */
   cycle_len = period_us;
   late_tick(period_us, 0);
@@ -1033,7 +1534,7 @@ void link_poll(void)
       if (j < 1) j = 1;                                    /* it went to the next cycle's channel on that POLL */
       ch = dml_channel((uint8_t)(g->g_cyc[e] + j), g->g_mask[e]);
     }
-    if (hw ? !poll_slot_hw(i, ch, target, 1, target + slot_us) : !poll_slot(i, ch, t0)) missed |= 1u << i;
+    if (!poll_one(i, ch, t0, 1, target + slot_us)) missed |= 1u << i;   /* (mode 3: t0 is target) */
     if (hw) t0 = ex_t_tx - HX_RAMP_US;                      /* measured from its actual start */
     const uint32_t dur = us_now() - t0;
     ex_hist[dur / 50 < EX_BUCKETS ? dur / 50 : EX_BUCKETS - 1]++; ex_hn++;
@@ -1046,6 +1547,24 @@ void link_poll(void)
     ex_budget = (b + 1) * 50u;
     memset(ex_hist, 0, sizeof ex_hist); ex_hn = 0; ex_cycles = 0;
   }
+  if (sat) {                                                /* repeaters: NEEDs, then the join beacon (no re-polls) */
+    const uint32_t tn = t_c + (uint32_t)k * slot_us;
+    /* The last POLL got no answer, but a late one may still be on the air: start the NEEDs only after the
+       longest possible answer (turnaround + full RESP) would have ended. */
+    uint32_t tg = tn;
+    const int last = 31 - __builtin_clz(plan | 1u);
+    if ((missed >> last) & 1) {                              /* (only planned slots are in missed) */
+      const uint32_t safe = NRF_TIMER3->CC[CC_TXRDY] + 4u * (9u + DML_POLL_HDR + sl[last].down_sent) + 400u + 4u * (9u + max_resp) - HX_RAMP_US;
+      if ((int32_t)(safe - tg) > 0) tg = safe;
+    }
+    /* Wanted: the slots that lost this cycle's answer, and those holding an answer behind a lost one (the
+       repeater may have the lost one from the cycle before). Not slots rejoining after a dup run. */
+    uint16_t want = 0;
+    for (int i = 0; i < DML_SLOTS; i++)
+      if ((plan >> i) & 1 && ((missed >> i) & 1 || sl[i].held) && !slot_skipping(&sl[i])) want |= (uint16_t)(1u << i);
+    if (need_round(want, sat_listen(missed), tg, tn)) join_cyc = 0;
+    return;
+  }
   /* A slot that missed its POLL is polled again in this cycle's spare time (cycles without a join
      window, while a whole slot still fits): its data waited a full cycle otherwise, and a weak link
      losing a few in a row piled those up. Off by default: with six devices only 106 of 1357 re-polls
@@ -1057,7 +1576,7 @@ void link_poll(void)
       const uint32_t tr = us_now();
       if ((int32_t)(t_c + period_us - (tr + slot_us)) < 0) break;
       repolls++;
-      if (hw ? poll_slot_hw(i, cur_ch, 0, 0, 0) : poll_slot(i, cur_ch, tr)) repolls_ok++;
+      if (poll_one(i, cur_ch, tr, 0, 0)) repolls_ok++;
     }
   if (join) {
     wait_until(t_c + (uint32_t)k * slot_us);
@@ -1133,7 +1652,7 @@ int link_stream_pop(uint8_t *rep, int itf)
 
 static void put32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
 
-int link_cmd(const uint8_t *in, uint8_t *d, uint8_t *st)    /* 0x20..0x2F, 0x32..0x3B; d = 61 bytes */
+int link_cmd(const uint8_t *in, uint8_t *d, uint8_t *st)    /* 0x20..0x2F, 0x32..0x3F; d = 61 bytes */
 {
   uint8_t i = in[2] < DML_SLOTS ? in[2] : 0;
   slot_t *s = &sl[i];
@@ -1141,6 +1660,7 @@ int link_cmd(const uint8_t *in, uint8_t *d, uint8_t *st)    /* 0x20..0x2F, 0x32.
   case 0x20: if (in[2] != 0xFF) link_on = in[2]; d[0] = link_on; return 1;   /* radio_off happens in link_poll */
   case 0x21: {                                              /* down: [slot][len][frame] */
     uint8_t n = in[3];
+    if (pairs.r.role) { *st = 2; return 1; }                  /* a repeater has no devices */
     if (n == 0 || n > 63 || s->down_len + 1u + n > sizeof s->down_buf) { *st = 2; return 1; }
     s->down_buf[s->down_len++] = n; memcpy(s->down_buf + s->down_len, in + 4, n); s->down_len += n;
     s->down_frames++;
@@ -1174,6 +1694,59 @@ int link_cmd(const uint8_t *in, uint8_t *d, uint8_t *st)    /* 0x20..0x2F, 0x32.
     if (in[2] > 1 && in[2] != 0xFF) { *st = 2; return 1; }
     if (in[2] != 0xFF) ghost = in[2];
     d[0] = ghost; put32(d + 2, ghost_polls); put32(d + 6, ghost_ok); return 1;
+  case 0x3C:                                                /* main: repeaters in use [mask, 0xFF: read][1: save now] */
+    if (in[2] != 0xFF) {
+      if (in[2] >> DML_SAT_MAX || pairs.r.role) { *st = 2; return 1; }   /* bad mask, or we're a repeater */
+      /* in RAM at once; a newly used id starts with clear stats */
+      if (in[2] != sat_on) {
+        for (int k = 0; k < DML_SAT_MAX; k++) if ((in[2] >> k) & 1 && !((sat_on >> k) & 1)) memset(&sats[k], 0, sizeof sats[k]);
+        sat_on = in[2];
+      }
+      /* setup: save to flash now */
+      if (in[3] == 1) sat_save();
+    }
+    d[0] = sat_on; d[1] = pairs.r.sat_mask; return 1;
+  case 0x3D:                                                /* repeater status [page]; counters are totals */
+    if (in[2] == 1) {                                       /* per slot: RESPs heard (u32 from 1), -dBm (average, from 41) */
+      d[0] = 1;
+      for (int k = 0; k < DML_SLOTS; k++) { put32(d + 1 + 4 * k, sv_heard[k]); d[1 + 4 * DML_SLOTS + k] = (uint8_t)(sv_rssi16[k] / 16); }
+      return 1;
+    }
+    if (in[2]) { *st = 2; return 1; }
+    d[0] = pairs.r.role; d[1] = link_led() > 0; d[2] = pairs.r.sat_id; d[3] = sv_ch;
+    put32(d + 4, sv_cycles); put32(d + 8, sv_needs); put32(d + 12, sv_sreps); d[16] = (uint8_t)(sv_mrssi16 / 16);
+    return 1;
+  case 0x3E:                                                /* main: relay stats [page][first]; totals */
+    d[0] = in[2];
+    if (in[2] == 0) {                                       /* per repeater: 16 B each from byte 1 */
+      for (int k = 0; k < DML_SAT_MAX; k++) {
+        uint8_t *e = d + 1 + 16 * k; const satst_t *q = &sats[k];
+        put32(e, q->asks); put32(e + 4, q->sreps); put32(e + 8, q->acc);
+        put32(e + 12, q->last_ms ? ms_ticks - q->last_ms : 0xFFFFFFFFu);
+      }
+      d[33] = sat_on; d[34] = (uint8_t)sat_r; d[35] = (uint8_t)(sat_r >> 8);
+    } else if (in[2] == 1) {                                /* 6 slots from [first 0-4], 9 B each */
+      if (in[3] > DML_SLOTS - 6) { *st = 2; return 1; }
+      for (int k = 0; k < 6; k++) {
+        const int j = in[3] + k; uint8_t *e = d + 1 + 9 * k;
+        put32(e, rly[j].relayed); put32(e + 4, rly[j].acc); e[8] = rly[j].rssi;
+      }
+    } else *st = 2;
+    return 1;
+  /* role: [0 main/1 repeater, 0xFF: read][id][main's base u32] */
+  case 0x3F:
+    if (in[2] != 0xFF) {
+      uint32_t mb; memcpy(&mb, in + 4, 4);
+      /* the main's base must be a valid network base, and not our own */
+      const int okb = (mb & 0x80808080u) == 0 && (mb & 0x01010101u) == 0x01010101u && mb != net_base;
+      if (in[2] > 1 || (in[2] == 1 && (in[3] >= DML_SAT_MAX || !okb))) { *st = 2; return 1; }
+      const int same = pairs.r.role == in[2] && (in[2] == 0 || (pairs.r.sat_id == in[3] && pairs.r.main_base == mb));
+      if (in[2] == 1) { pairs.r.sat_id = in[3]; pairs.r.main_base = mb; pairs.r.sat_mask = 0; sat_on = 0; }
+      if (!same) { pairs.r.role = in[2]; pairs_save(); }      /* link_poll switches to it */
+    }
+    d[0] = pairs.r.role; d[1] = pairs.r.sat_id; put32(d + 2, pairs.r.main_base); put32(d + 6, net_base);
+    d[10] = sat_on; d[11] = role_run;
+    return 1;
   case 0x33:                                                /* make a slot's radio rejoin: [slot] */
     /* Not polled past the radio's 1 s "dongle gone" timeout, as after a long dup run. The
        host asks for it when a connected device has sent nothing for seconds. */
@@ -1210,6 +1783,7 @@ int link_cmd(const uint8_t *in, uint8_t *d, uint8_t *st)    /* 0x20..0x2F, 0x32.
     put32(d + 32, s->held_set); put32(d + 36, s->held_used);                         /* selective ack: answers kept, delivered */
     return 1;
   case 0x24:                                                /* pair SECS [SLOT+1] [ANY] (0/absent: first free slot) */
+    if (pairs.r.role) { *st = 2; return 1; }                  /* a repeater never opens a network */
     pairing_until_ms = in[2] ? ms_ticks + 1000u * in[2] : 0;
     pair_target = in[3] >= 1 && in[3] <= DML_SLOTS ? (uint8_t)(in[3] - 1) : 0xFF;
     pair_any = in[4] == 1 && pair_target < DML_SLOTS;       /* [4] 1: any unknown device, not only pairing ones */
@@ -1288,7 +1862,7 @@ int link_cmd(const uint8_t *in, uint8_t *d, uint8_t *st)    /* 0x20..0x2F, 0x32.
 void link_rssi_scan(uint8_t first, uint8_t *out, int n)    /* -dBm per channel, 0xFF = no sample */
 {
   uint8_t was_on = link_on;
-  link_on = 0; radio_off();
+  link_on = 0; radio_off(); sv_started = 0;                 /* a repeater restarts its receiver after */
   for (int i = 0; i < n; i++) {
     uint8_t ch = (uint8_t)(first + i);
     if (ch > 100) { out[i] = 0xFF; continue; }

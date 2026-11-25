@@ -30,6 +30,26 @@
  *        flags bit0: pairing mode; bit1: can add the codec's CRC-8 (doorman_codec.h `check`); bit2: can send
  *        batches (doorman_lh2p.h: every frame queued for an answer coded together, LH2 light predicted)
  * frames = repeated [len][len bytes]: exactly the frames the tracker MCU and its radio exchange over SPI.
+ *
+ * Repeater dongles (called satellites in the code), dongle firmware 0x002F. These go only between dongles;
+ * device radios never receive them, because their address base, DML_SAT_BASE(net base), is no slot or join
+ * address. Slot masks are u16, bit = slot.
+ * NEED  [06][sat id][next cycle][mask lo][mask hi][period/50us][us from this ADDRESS to the next cycle's
+ *        start, u16][listen u16][wanted u16][max SREP len][flags][expected seq of each wanted slot, in slot
+ *        order]                                                (main -> repeater, prefix 0xC0 + sat id)
+ *        The main sends one to each repeater in use after the device slots (to an absent repeater only every
+ *        16th cycle; none in a cycle without room). wanted: the slots whose next answer the main is missing
+ *        (lost this cycle, or held behind a lost one, see DML_F_SACK); 0 means no reply is expected. listen:
+ *        the slots the repeater listens to in the next cycle (at most 7: the radio has 8 addresses, one is the
+ *        NEED's). Right after a NEED, the repeater moves to the next cycle's channel. flags bit 0: the next
+ *        start is unknown (the cycle overran).
+ * SREP  [07][sat id][cycle][heard u16][-dBm of each heard slot, in slot order][records: [slot][n][n bytes of
+ *        the RESP as heard]...]   (repeater -> main: the reply to a NEED with wanted != 0, same address,
+ *                                  at most max SREP len bytes)
+ *        heard: the slots whose RESP the repeater received with a good CRC this cycle. For each wanted slot,
+ *        the repeater keeps the RESPs it heard in this cycle and the one before and sends the one with the
+ *        expected seq, then the one after it (seq + 1) if it has that too, or only that one: the main takes the
+ *        first and keeps the second as a selective ack would. Records that don't fit are left out.
  */
 #pragma once
 #include <stdint.h>
@@ -70,6 +90,17 @@ enum { DML_POLL = 0x01, DML_RESP = 0x02, DML_JOIN = 0x03, DML_JREQ = 0x04 };
 #define DML_JF_CHECK       0x02               /* JREQ: can add the codec CRC-8; JOIN: do (for the assigned id) */
 #define DML_JF_BATCH       0x04               /* JREQ: can send batches (doorman_lh2p.h); JOIN: do (for the assigned id) */
 #define DML_JF_BATCH32      0x08               /* with BATCH: wide batches, up to 32 frames (doorman_lh2p.h DMC_BATCH_W) */
+/* Repeater dongles: NEED / SREP (see above). */
+enum { DML_NEED = 0x06, DML_SREP = 0x07 };
+#define DML_SAT_PREFIX     0xC0u              /* + repeater id */
+#define DML_SAT_MAX        2
+#define DML_SAT_LISTEN     7                  /* slots a repeater listens to (radio addresses 1-7) */
+#define DML_NEED_HDR       14
+#define DML_SREP_HDR       5
+#define DML_NEED_F_NOSTART 0x01               /* NEED flag: no valid next start (the cycle overran) */
+#define DML_SREP_TURN_US   60                 /* NEED end -> repeater TXEN (main receives from ~45 us) */
+/* Top bit set in every byte: never a network base (they have it clear) or the join base. */
+#define DML_SAT_BASE(net)  ((net) ^ 0x80808080u)
 
 /* channel for a cycle: the (cycle % n)-th allowed hop channel */
 static inline uint8_t dml_channel(uint8_t cycle, uint16_t mask)
