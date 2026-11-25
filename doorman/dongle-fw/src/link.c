@@ -111,6 +111,7 @@ typedef struct {
      announced mask, period as the device keeps it; [0] valid when g_have), and the polls it missed since */
   uint32_t g_t[2]; uint16_t g_mask[2], g_per[2], g_miss; uint8_t g_cyc[2], g_have;
   uint32_t load_bytes, load_budget;     /* test load (0x2B): filler queued, and owed */   /* raw -dBm; min/max reset on read (0x29) */
+  uint8_t down_sent;                    /* downlink bytes sent and not yet acked: the start of down_buf */
 } slot_t;
 static slot_t sl[DML_SLOTS];
 static uint8_t link_on = 1;
@@ -403,7 +404,9 @@ static int poll_slot(uint8_t i, uint8_t ch, uint32_t t_tx)   /* 1: it answered; 
   p[2] = (uint8_t)((s->last_seq & DML_F_SEQ_MASK) | (s->dseq ? DML_F_DSEQ : 0) | (s->held ? DML_F_SACK : 0));
   p[3] = cycle; p[4] = (uint8_t)next_mask; p[5] = (uint8_t)(next_mask >> 8);
   p[6] = (uint8_t)(period_us >= PERIOD_MAX_US ? 255 : period_us / 50); p[7] = max_resp;
-  if (s->down_len) { p[2] |= DML_F_DOWN; memcpy(p + len, s->down_buf, s->down_len); len += s->down_len; }
+  /* picked when nothing is in flight: a resend repeats it, and frames queued meanwhile wait */
+  if (!s->down_sent) s->down_sent = s->down_len;
+  if (s->down_sent) { p[2] |= DML_F_DOWN; memcpy(p + len, s->down_buf, s->down_sent); len += s->down_sent; }
   pkt_tx[0] = (uint8_t)len;
   s->polls++;
   int hop = -1;
@@ -441,7 +444,13 @@ static int poll_slot(uint8_t i, uint8_t ch, uint32_t t_tx)   /* 1: it answered; 
   if (s->have_tel) { s->t_missed += (uint8_t)(r[4] - s->last_missed); s->t_crc += (uint8_t)(r[5] - s->last_crc); }
   s->last_missed = r[4]; s->last_crc = r[5]; s->have_tel = 1;
   uint8_t dack = (r[2] & DML_F_DSEQ) ? 1 : 0;
-  if (s->down_len) { if (dack == s->dseq) { s->down_len = 0; s->dseq ^= 1; } else s->down_resends++; }
+  if (s->down_sent) {
+    if (dack == s->dseq) {                                  /* acked: drop the sent bytes, keep what was queued since */
+      s->down_len = (uint8_t)(s->down_len - s->down_sent);
+      memmove(s->down_buf, s->down_buf + s->down_sent, s->down_len);
+      s->down_sent = 0; s->dseq ^= 1;
+    } else s->down_resends++;
+  }
   uint8_t seq = r[2] & DML_F_SEQ_MASK;
   if (seq != ((s->last_seq + 1) & DML_F_SEQ_MASK)) {                          /* duplicate / out of order */
     if (!s->held && seq == ((s->last_seq + 2) & DML_F_SEQ_MASK) && n - DML_RESP_HDR <= DML_MAXLEN) {   /* the one after a lost one */
@@ -560,7 +569,7 @@ static void slot_reset(uint8_t i)
   dmp_reset(&s->lh2p);
   s->in_batch = 0;
   memset(s->ident, 0, sizeof s->ident);
-  s->up_head = s->up_tail; s->frag_left = 0; s->pk_rest = 0;
+  s->up_head = s->up_tail; s->frag_left = 0; s->pk_rest = 0; s->down_sent = 0;
   s->pend_n = s->pend_k = 0;                               /* the old device's answer isn't for the new codec */
   s->held = 0;
   s->late_state = 0xFF; s->ver_asked = 0; s->late_ask_ms = 0;   /* told again: a radio that rebooted has them on */
