@@ -10,12 +10,14 @@
  *   PPI 2   RADIO DISABLED -> RADIO RXEN: receive the answer right after a POLL is sent. It's in PPI group 0,
  *           which its fork disables, so it fires once each time it's armed.
  *   PPI 3   RADIO ADDRESS -> TIMER3 CAPTURE[2].  PPI 7: RADIO TXREADY -> TIMER3 CAPTURE[4]. */
-#pragma GCC optimize("O2")   /* the air codec is decoded here for every device: speed over size (~4700 frames/s at 10) */
 #include <string.h>
 #include "nrf.h"
 #include "doorman_link.h"
+#pragma GCC push_options
+#pragma GCC optimize("O2")   /* the codec: see decode_step */
 #include "doorman_codec.h"
 #include "doorman_lh2p.h"
+#pragma GCC pop_options
 #include "sizing.h"
 #include "link.h"
 #include "dongle.h"
@@ -223,6 +225,10 @@ static int upq_push(slot_t *s, const uint8_t *f, int gl)
   if (upq_used(s) > s->upq_hw) s->upq_hw = upq_used(s);
   return 1;
 }
+/* The air codec is decoded here for every device: speed over size (~4700 frames/s at 10). Only the decoder:
+   the rest of the file stays at -Os, or the image no longer fits the SoftDevice boot stub (ld/stub_sd.ld). */
+#pragma GCC push_options
+#pragma GCC optimize("O2")
 /* Decodes one frame of a slot's kept answer (in order: the air codec's state follows every frame);
    0 when there's nothing left. */
 static uint32_t dec_sum, dec_n, dec_max;
@@ -308,6 +314,7 @@ static int decode_some(void)
   for (int i = 0; i < DML_SLOTS; i++) if (decode_step(&sl[i])) return 1;
   return 0;
 }
+#pragma GCC pop_options
 
 /* ---------------- front-end amplifier (Holyiot 21017: SKY66112, CTX P0.24 / CRX P0.22) ----------------
    Both pins are GPIOTE task outputs. Software raises CTX before TXEN and CRX before RXEN; the TX->RX
