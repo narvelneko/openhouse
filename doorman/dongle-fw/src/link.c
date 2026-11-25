@@ -1,5 +1,15 @@
 /* openhouse link v1, dongle side (see common/doorman_link.h): slots, joining/pairing, hopping, go-back-N.
- * Everything is polled from the main loop (no radio interrupts). */
+ * Everything is polled from the main loop (no radio interrupts).
+ *
+ * Timers and PPI channels:
+ *   TIMER3  1 MHz, free running: the link's microsecond clock. CC[0]: us_now(). CC[1]: the compare that
+ *           starts a POLL in timing mode 3. CC[2]: time of the last RADIO ADDRESS. CC[4]: time of the last
+ *           RADIO TXREADY.
+ *   PPI 0   the amplifier's turnaround (Holyiot only, see fem_*).
+ *   PPI 1   TIMER3 CC[1] -> RADIO TXEN; its fork switches the amplifier to TX (Holyiot).
+ *   PPI 2   RADIO DISABLED -> RADIO RXEN: receive the answer right after a POLL is sent. It's in PPI group 0,
+ *           which its fork disables, so it fires once each time it's armed.
+ *   PPI 3   RADIO ADDRESS -> TIMER3 CAPTURE[2].  PPI 7: RADIO TXREADY -> TIMER3 CAPTURE[4]. */
 #pragma GCC optimize("O2")   /* the air codec is decoded here for every device: speed over size (~4700 frames/s at 10) */
 #include <string.h>
 #include "nrf.h"
@@ -12,7 +22,7 @@
 #include "banks.h"
 
 extern volatile uint32_t ms_ticks;
-static uint32_t us_now(void) { NRF_TIMER1->TASKS_CAPTURE[0] = 1; return NRF_TIMER1->CC[0]; }
+static uint32_t us_now(void) { NRF_TIMER3->TASKS_CAPTURE[0] = 1; return NRF_TIMER3->CC[0]; }
 
 /* ---------------- paired trackers (persisted in the last app flash page) ---------------- */
 #define PAIR_MAGIC  0x3150484Fu        /* "OHP1": DML_SLOTS slots */
@@ -112,6 +122,7 @@ typedef struct {
   uint32_t g_t[2]; uint16_t g_mask[2], g_per[2], g_miss; uint8_t g_cyc[2], g_have;
   uint32_t load_bytes, load_budget;     /* test load (0x2B): filler queued, and owed */   /* raw -dBm; min/max reset on read (0x29) */
   uint8_t down_sent;                    /* downlink bytes sent and not yet acked: the start of down_buf */
+  uint32_t poll_t;                      /* start time of its last POLL */
 } slot_t;
 static slot_t sl[DML_SLOTS];
 static uint8_t link_on = 1;
@@ -335,8 +346,18 @@ static void fem_turnaround_disarm(void) {}
 #endif
 
 /* ---------------- radio primitives ---------------- */
+#define PPI_LAUNCH 1                   /* TIMER3 COMPARE[1] -> TXEN; fork: amplifier to TX (Holyiot) */
+#define PPI_TURN   2                   /* RADIO DISABLED -> RXEN; fork: disables group 0 (fires once) */
+#define PPI_ADDR   3                   /* RADIO ADDRESS -> TIMER3 CAPTURE[2] */
+#define PPI_TXRDY  7                   /* RADIO TXREADY -> TIMER3 CAPTURE[4] */
+#define HX_GROUP   0                   /* PPI group: PPI_TURN (and the amplifier's turnaround, Holyiot) */
+#define CC_LAUNCH  1
+#define CC_ADDR    2
+#define CC_TXRDY   4
 static void radio_off(void)
 {
+  NRF_PPI->CHENCLR = 1u << PPI_LAUNCH;                      /* else it fires again when TIMER3 wraps */
+  NRF_PPI->TASKS_CHG[HX_GROUP].DIS = 1;
   NRF_RADIO->SHORTS = 0;
   fem_turnaround_disarm();
   NRF_RADIO->EVENTS_DISABLED = 0; NRF_RADIO->TASKS_DISABLE = 1;
@@ -393,49 +414,69 @@ static int slot_skipping(const slot_t *s) { return s->skip_until && (int32_t)(ms
    later (1.3 s seen); slot_reset ends the skip then. Polled again before that, the slot goes inactive and the
    host drops the device. */
 static void slot_skip(slot_t *s) { s->skip_until = ms_ticks + 1500; if (!s->skip_until) s->skip_until = 1; }
+static int hop_of(uint8_t ch) { for (int k = 0; k < DML_NHOP; k++) if (dml_hop_ch[k] == ch) return k; return -1; }
 
-static int poll_slot(uint8_t i, uint8_t ch, uint32_t t_tx)   /* 1: it answered; ch: cur_ch, or a ghost-follow channel */
+/* Builds slot i's POLL in b (b[0]: length). Its downlink is picked only when nothing is in flight: whole
+   frames from down_buf, at most down_max bytes. Until the device acks them, every POLL resends the same bytes,
+   and frames queued meanwhile wait for a later POLL. Returns ch's hop index, or -1 for a ghost-follow channel. */
+static int poll_build(uint8_t *b, uint8_t i, uint8_t ch, int down_max)
 {
   slot_t *s = &sl[i];
-  while (decode_step(s)) {}                                 /* its last answer first: the ack is for it */
-  uint8_t *p = pkt_tx + 1;
+  uint8_t *p = b + 1;
   int len = DML_POLL_HDR;
   p[0] = DML_POLL; p[1] = i;
   p[2] = (uint8_t)((s->last_seq & DML_F_SEQ_MASK) | (s->dseq ? DML_F_DSEQ : 0) | (s->held ? DML_F_SACK : 0));
   p[3] = cycle; p[4] = (uint8_t)next_mask; p[5] = (uint8_t)(next_mask >> 8);
   p[6] = (uint8_t)(period_us >= PERIOD_MAX_US ? 255 : period_us / 50); p[7] = max_resp;
-  /* picked when nothing is in flight: a resend repeats it, and frames queued meanwhile wait */
-  if (!s->down_sent) s->down_sent = s->down_len;
+  if (!s->down_sent)
+    while (s->down_sent < s->down_len && s->down_sent + 1 + s->down_buf[s->down_sent] <= down_max)
+      s->down_sent = (uint8_t)(s->down_sent + 1 + s->down_buf[s->down_sent]);
   if (s->down_sent) { p[2] |= DML_F_DOWN; memcpy(p + len, s->down_buf, s->down_sent); len += s->down_sent; }
-  pkt_tx[0] = (uint8_t)len;
+  b[0] = (uint8_t)len;
   s->polls++;
-  int hop = -1;
-  if (ch == cur_ch) { for (int k = 0; k < DML_NHOP; k++) if (dml_hop_ch[k] == cur_ch) hop = k; }
-  else ghost_polls++;                                       /* ghost polls stay out of the channel statistics */
+  const int hop = ch == cur_ch ? hop_of(cur_ch) : -1;
+  if (ch != cur_ch) ghost_polls++;                          /* ghost polls stay out of the channel statistics */
   if (hop >= 0) chs[hop].polls++;
+  return hop;
+}
+/* Counts a POLL that got no valid answer (n: the receive result; -3 is a CRC error). */
+static void poll_missed(slot_t *s, int n, int hop)
+{
+  if (n == -3) s->crc_err++; else s->timeouts++;
+  if (hop >= 0) chs[hop].lost++;
+  if (s->active && ms_ticks - s->last_resp_ms > 1000) s->active = 0;
+  if (s->g_miss < 0xFFFF) s->g_miss++;
+}
+static int answer_take(uint8_t i, const uint8_t *r, int n, uint8_t rd);
+static int poll_slot(uint8_t i, uint8_t ch, uint32_t t_tx)   /* 1: it answered; ch: cur_ch, or a ghost-follow channel */
+{
+  slot_t *s = &sl[i];
+  while (decode_step(s)) {}                                 /* its last answer first: the ack is for it */
+  const int hop = poll_build(pkt_tx, i, ch, 255);
+  s->poll_t = t_tx;
   int n = txrx(ch, net_base, (uint8_t)(DML_SLOT_PREFIX + i), 400);
   if (test_drop_pct && n > 0) {                             /* test: lost as if in the air (the device resends) */
     test_rng = test_rng * 1664525u + 1013904223u;
     if ((test_rng >> 16) % 100u < test_drop_pct) n = -2;
   }
   const uint8_t *r = pkt_rx + 1;
-  if (n < DML_RESP_HDR || r[0] != DML_RESP || r[1] != i) {
-    if (n == -3) s->crc_err++; else s->timeouts++;
-    if (hop >= 0) chs[hop].lost++;
-    if (s->active && ms_ticks - s->last_resp_ms > 1000) s->active = 0;
-    if (s->g_miss < 0xFFFF) s->g_miss++;
-    return 0;
-  }
-  s->resp_ok++;
+  if (n < DML_RESP_HDR || r[0] != DML_RESP || r[1] != i) { poll_missed(s, n, hop); return 0; }
   if (ch != cur_ch) ghost_ok++;
+  return answer_take(i, r, n, (uint8_t)NRF_RADIO->RSSISAMPLE);
+}
+/* Takes a valid answer (type and slot already checked) from slot i to this cycle's POLL. rd: its signal
+   here in -dBm. */
+static int answer_take(uint8_t i, const uint8_t *r, int n, uint8_t rd)
+{
+  slot_t *s = &sl[i];
+  s->resp_ok++;
   s->g_t[1] = s->g_t[0]; s->g_cyc[1] = s->g_cyc[0]; s->g_mask[1] = s->g_mask[0];
   s->g_per[1] = s->g_have ? s->g_per[0] : 0;               /* 0: no earlier record */
-  s->g_t[0] = t_tx; s->g_cyc[0] = cycle; s->g_mask[0] = next_mask;
+  s->g_t[0] = s->poll_t; s->g_cyc[0] = cycle; s->g_mask[0] = next_mask;
   s->g_per[0] = (uint16_t)(period_us / 50 * 50); s->g_have = 1;   /* what the device keeps of p[6] */
   s->g_miss = 0;
   s->active = 1; s->last_resp_ms = ms_ticks;
   if (i == just_paired_slot) just_paired_slot = 0xFF;     /* it joined: its pairing is over, the next one needs pairing open */
-  uint8_t rd = (uint8_t)NRF_RADIO->RSSISAMPLE;
   s->rssi_last_d = rd; s->rssi_last_t = r[3];
   if (!s->rssi_min_d || rd < s->rssi_min_d) s->rssi_min_d = rd;   /* strongest (smallest -dBm) */
   if (rd > s->rssi_max_d) s->rssi_max_d = rd;                      /* weakest */
@@ -489,6 +530,116 @@ static int poll_slot(uint8_t i, uint8_t ch, uint32_t t_tx)   /* 1: it answered; 
   }
   if (!defer_decode) while (decode_step(s)) {}
   return 1;
+}
+
+/* ---------------- timing mode 3 (cmd 0x2D): compare-started POLLs ----------------
+   The same schedule as mode 1, but the hardware starts each POLL: TIMER3 COMPARE[1] triggers TXEN through
+   PPI, and a one-shot PPI link (DISABLED -> RXEN) switches the radio to receive the answer into the same
+   buffer. The CPU has no deadline inside an exchange, so it can serve USB while one is on the air. */
+static uint8_t tmode = 3, tmode_req = 3;
+#define HX_RAMP_US       40u           /* radio ramp-up, TXEN to TXREADY (fast mode) */
+#define HX_ARM_MIN_US    10            /* a start closer than this is done by software */
+#define HX_DOWN_MAX      64            /* max downlink bytes per POLL (one air-update block) */
+#define HX_PREP_US       30u           /* after an exchange: take the answer, set up the next */
+static uint8_t hx_buf[2 + DML_MAXLEN];
+static uint32_t hx_usb_cost = 100;    /* recent worst idle_hook() (USB) pass, us; decays */
+static uint32_t ex_t_tx;              /* TXREADY time of the last exchange (start + ramp-up) */
+
+/* Prepares one exchange (address and channel already set): send pkt, then receive the answer into it. */
+static void hx_setup(const uint8_t *pkt)
+{
+  NRF_RADIO->PACKETPTR = (uint32_t)pkt;
+  NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk | RADIO_SHORTS_ADDRESS_RSSISTART_Msk;
+  NRF_RADIO->EVENTS_DISABLED = 0; NRF_RADIO->EVENTS_ADDRESS = 0; NRF_RADIO->EVENTS_END = 0;
+  NRF_RADIO->EVENTS_READY = 0; NRF_RADIO->EVENTS_TXREADY = 0; NRF_RADIO->EVENTS_RXREADY = 0;
+  NRF_RADIO->EVENTS_CRCOK = 0; NRF_RADIO->EVENTS_CRCERROR = 0;
+  fem_off();
+  NRF_PPI->TASKS_CHG[HX_GROUP].EN = 1;                     /* arm the turnaround: DISABLED -> RXEN, once */
+  NRF_TIMER3->EVENTS_COMPARE[CC_LAUNCH] = 0;
+}
+/* Starts the prepared exchange at target through the compare, or from software right away when it isn't
+   timed or target is too close. Call with interrupts off. Returns the start time. */
+static uint32_t hx_launch(uint32_t target, int timed)
+{
+  if (timed && (int32_t)(target - us_now()) >= HX_ARM_MIN_US) {
+    NRF_TIMER3->CC[CC_LAUNCH] = target;
+    NRF_PPI->CHENSET = 1u << PPI_LAUNCH;
+    if ((int32_t)(target - us_now()) > 0) return target;   /* still ahead of the timer: the compare will fire */
+  }
+  NRF_PPI->CHENCLR = 1u << PPI_LAUNCH;
+  const uint32_t tstart = us_now();
+  if (NRF_RADIO->STATE == RADIO_STATE_STATE_Disabled && !NRF_TIMER3->EVENTS_COMPARE[CC_LAUNCH]) {
+    fem_tx(); NRF_RADIO->TASKS_TXEN = 1;                   /* the compare didn't fire: start now */
+  }
+  return tstart;
+}
+/* Serves USB and decodes frames while an exchange is on the air, if there's time before the next start
+   (next_t; 0: no next start). s: the slot whose frames are decoded first. */
+static void hx_service(uint32_t now, uint32_t next_t, slot_t *s)
+{
+  const int32_t left = next_t ? (int32_t)(next_t - now) : 0x7FFFFFFF;
+  if (idle_hook && left > (int32_t)(hx_usb_cost + HX_PREP_US)) {
+    idle_hook();
+    const uint32_t d = us_now() - now;
+    if (d > hx_usb_cost) hx_usb_cost = d > 200 ? 200 : d;   /* longer: a flash write or enumeration */
+  }
+  /* a frame takes up to ~100 us */
+  if ((int32_t)(next_t ? next_t - us_now() : 0x7FFFFFFF) > (int32_t)(100u + HX_PREP_US))
+    if (!(s && decode_step(s))) decode_some();
+}
+/* Sends hx_buf at target, then receives one answer into hx_buf, serving USB while it waits. Returns the
+   answer's length, -1 for no answer, -3 for a CRC error. */
+static int hx_txrx(uint8_t ch, uint32_t base, uint8_t prefix, uint32_t target, int timed, uint32_t next_t,
+                   uint32_t wait_us, slot_t *s)
+{
+  const uint8_t plen = hx_buf[0];
+  NRF_RADIO->FREQUENCY = ch;
+  NRF_RADIO->BASE0 = base; NRF_RADIO->PREFIX0 = prefix;
+  NRF_RADIO->TXADDRESS = 0; NRF_RADIO->RXADDRESSES = 1;
+  hx_setup(hx_buf);
+  __disable_irq();
+  const uint32_t tstart = hx_launch(target, timed);
+  __enable_irq();
+  uint32_t t_rx = 0;
+  int r, rx = 0;
+  for (;;) {
+    /* received; the END -> DISABLE short stops the radio */
+    if (NRF_RADIO->EVENTS_CRCOK || NRF_RADIO->EVENTS_CRCERROR) {
+      const uint32_t t = us_now();
+      while (NRF_RADIO->STATE != RADIO_STATE_STATE_Disabled && us_now() - t < 20) {}
+      r = NRF_RADIO->EVENTS_CRCOK ? hx_buf[0] : -3;
+      break;
+    }
+    const uint32_t now2 = us_now();
+    /* The answer has begun: an ADDRESS after the receiver came up. (The POLL's own ADDRESS is at start + 64 us,
+       so one after start + 150 us is the answer's.) */
+    if (!rx && NRF_RADIO->EVENTS_RXREADY && NRF_RADIO->EVENTS_ADDRESS &&
+        (int32_t)(NRF_TIMER3->CC[CC_ADDR] - (tstart + 150u)) > 0) { rx = 1; t_rx = NRF_TIMER3->CC[CC_ADDR]; }
+    if (rx ? (int32_t)(now2 - t_rx) > 1600 : (int32_t)(now2 - (tstart + HX_RAMP_US + 4u * (9u + plen) + 4u + wait_us)) > 0) {
+      radio_off(); r = -1; break;
+    }
+    hx_service(now2, next_t, s);
+  }
+  NRF_PPI->CHENCLR = 1u << PPI_LAUNCH;                      /* disarm after every exchange */
+  NRF_PPI->TASKS_CHG[HX_GROUP].DIS = 1;
+  NRF_RADIO->SHORTS = 0; NRF_RADIO->EVENTS_DISABLED = 0;
+  fem_off();
+  ex_t_tx = NRF_RADIO->EVENTS_TXREADY ? NRF_TIMER3->CC[CC_TXRDY] : tstart + HX_RAMP_US;
+  return r;
+}
+/* poll_slot() for timing mode 3. Differences: at most HX_DOWN_MAX downlink bytes per POLL, and the slot's
+   previous answer is decoded while the exchange is on the air instead of before it. */
+static int poll_slot_hw(uint8_t i, uint8_t ch, uint32_t target, int timed, uint32_t next_t)
+{
+  slot_t *s = &sl[i];
+  const int hop = poll_build(hx_buf, i, ch, HX_DOWN_MAX);
+  int n = hx_txrx(ch, net_base, (uint8_t)(DML_SLOT_PREFIX + i), target, timed, next_t, 400, s);
+  s->poll_t = ex_t_tx - HX_RAMP_US;
+  while (decode_step(s)) {}                                 /* its previous answer first (usually done by now) */
+  const uint8_t *r = hx_buf + 1;
+  if (n < DML_RESP_HDR || r[0] != DML_RESP || r[1] != i) { poll_missed(s, n, hop); return 0; }
+  if (ch != cur_ch) ghost_ok++;
+  return answer_take(i, r, n, (uint8_t)NRF_RADIO->RSSISAMPLE);
 }
 
 /* ---------------- test load (0x2B) ---------------- */
@@ -767,8 +918,8 @@ static void hop_cycle_start(void)
 /* ---------------- main-loop entry points ---------------- */
 void link_init(void)
 {
-  NRF_TIMER1->MODE = 0; NRF_TIMER1->BITMODE = 3; NRF_TIMER1->PRESCALER = 4;   /* 1 MHz */
-  NRF_TIMER1->TASKS_CLEAR = 1; NRF_TIMER1->TASKS_START = 1;
+  NRF_TIMER3->MODE = 0; NRF_TIMER3->BITMODE = 3; NRF_TIMER3->PRESCALER = 4;   /* 1 MHz */
+  NRF_TIMER3->TASKS_CLEAR = 1; NRF_TIMER3->TASKS_START = 1;
   NRF_CLOCK->EVENTS_HFCLKSTARTED = 0; NRF_CLOCK->TASKS_HFCLKSTART = 1;
   uint32_t t = us_now(); while (!NRF_CLOCK->EVENTS_HFCLKSTARTED && us_now() - t < 5000) {}
   NRF_RADIO->POWER = 1;
@@ -783,6 +934,27 @@ void link_init(void)
   uint32_t h = NRF_FICR->DEVICEID[0] * 2654435761u ^ NRF_FICR->DEVICEID[1];
   net_base = (h & 0x7F7F7F7Fu) | 0x01010101u;               /* per-dongle network address */
   fem_init();
+  /* PPI, see the top of the file. The compare start and the one-shot turnaround stay off until an exchange
+     arms them; the other channels are always on. Group 0 holds the turnaround (and the amplifier's, Holyiot);
+     PPI_TURN's fork disables the group at the first DISABLED, so each fires once. */
+  NRF_PPI->CHENCLR = 1u << PPI_LAUNCH | 1u << PPI_TURN;
+  NRF_PPI->CH[PPI_LAUNCH].EEP = (uint32_t)&NRF_TIMER3->EVENTS_COMPARE[CC_LAUNCH];
+  NRF_PPI->CH[PPI_LAUNCH].TEP = (uint32_t)&NRF_RADIO->TASKS_TXEN;
+#if BOARD_HOLYIOT
+  NRF_PPI->FORK[PPI_LAUNCH].TEP = (uint32_t)&NRF_GPIOTE->TASKS_SET[FEM_GT_CTX];   /* amplifier TX on (fem_tx) */
+  NRF_PPI->CHG[HX_GROUP] = 1u << PPI_TURN | 1u << FEM_PPI;
+#else
+  NRF_PPI->FORK[PPI_LAUNCH].TEP = 0;
+  NRF_PPI->CHG[HX_GROUP] = 1u << PPI_TURN;
+#endif
+  NRF_PPI->CH[PPI_TURN].EEP = (uint32_t)&NRF_RADIO->EVENTS_DISABLED;
+  NRF_PPI->CH[PPI_TURN].TEP = (uint32_t)&NRF_RADIO->TASKS_RXEN;
+  NRF_PPI->FORK[PPI_TURN].TEP = (uint32_t)&NRF_PPI->TASKS_CHG[HX_GROUP].DIS;
+  NRF_PPI->CH[PPI_ADDR].EEP = (uint32_t)&NRF_RADIO->EVENTS_ADDRESS;
+  NRF_PPI->CH[PPI_ADDR].TEP = (uint32_t)&NRF_TIMER3->TASKS_CAPTURE[CC_ADDR];
+  NRF_PPI->CH[PPI_TXRDY].EEP = (uint32_t)&NRF_RADIO->EVENTS_TXREADY;
+  NRF_PPI->CH[PPI_TXRDY].TEP = (uint32_t)&NRF_TIMER3->TASKS_CAPTURE[CC_TXRDY];
+  NRF_PPI->CHENSET = 1u << PPI_ADDR | 1u << PPI_TXRDY;
   pairs_load();
   for (int i = 0; i < DML_SLOTS; i++) { sl[i].last_seq = 7; sl[i].dseq = 0; }
 }
@@ -792,6 +964,8 @@ void link_poll(void)
   load_tick();
   if (pairs_dirty) { pairs_dirty = 0; pairs_save(); }
   if (!link_on) { radio_off(); return; }
+  tmode = tmode_req; adaptive = tmode & 1;                  /* a mode change (0x2D) applies here */
+  const int hw = tmode == 3;
   /* TDMA plan, rebuilt each cycle from the connected slots: the k-th polled at t_c + k*slot_us, then the
      join window. Radios don't need their place in it: they listen for their own address and take the
      period from each POLL, so the plan can change from one cycle to the next. */
@@ -832,16 +1006,18 @@ void link_poll(void)
   late_tick(period_us, 0);
   if ((int32_t)(us_now() - t_c) > (int32_t)period_us || (int32_t)(t_c - us_now()) > (int32_t)period_us)
     t_c = us_now();                                         /* fell behind / first run: restart the plan */
-  wait_until(t_c);
+  if (!hw || !n) wait_until(t_c);                           /* mode 3: the compare starts the first POLL */
+  if (hx_usb_cost > 40) hx_usb_cost -= (hx_usb_cost - 40 + 15) / 16;   /* decays back toward 40 us */
   hop_cycle_start();
   int k = 0;
   uint32_t missed = 0;
   for (uint8_t i = 0; i < DML_SLOTS; i++) {
     if (!((plan >> i) & 1)) continue;
-    wait_until(t_c + (uint32_t)k * slot_us);
+    const uint32_t target = t_c + (uint32_t)k * slot_us;
+    if (!hw) wait_until(target);
     k++;
     if (slot_skipping(&sl[i])) continue;                    /* its place, left empty */
-    const uint32_t t0 = us_now();
+    uint32_t t0 = hw ? target : us_now();
     uint8_t ch = cur_ch;
     const slot_t *g = &sl[i];
     if (ghost && g->g_have && g->g_miss % 3 != 0 && t0 - g->g_t[0] < 1000000u) {
@@ -850,7 +1026,8 @@ void link_poll(void)
       if (j < 1) j = 1;                                    /* it went to the next cycle's channel on that POLL */
       ch = dml_channel((uint8_t)(g->g_cyc[e] + j), g->g_mask[e]);
     }
-    if (!poll_slot(i, ch, t0)) missed |= 1u << i;
+    if (hw ? !poll_slot_hw(i, ch, target, 1, target + slot_us) : !poll_slot(i, ch, t0)) missed |= 1u << i;
+    if (hw) t0 = ex_t_tx - HX_RAMP_US;                      /* measured from its actual start */
     const uint32_t dur = us_now() - t0;
     ex_hist[dur / 50 < EX_BUCKETS ? dur / 50 : EX_BUCKETS - 1]++; ex_hn++;
     ex_sum += dur; ex_n++;
@@ -873,7 +1050,7 @@ void link_poll(void)
       const uint32_t tr = us_now();
       if ((int32_t)(t_c + period_us - (tr + slot_us)) < 0) break;
       repolls++;
-      if (poll_slot(i, cur_ch, tr)) repolls_ok++;
+      if (hw ? poll_slot_hw(i, cur_ch, 0, 0, 0) : poll_slot(i, cur_ch, tr)) repolls_ok++;
     }
   if (join) {
     wait_until(t_c + (uint32_t)k * slot_us);
@@ -997,13 +1174,17 @@ int link_cmd(const uint8_t *in, uint8_t *d, uint8_t *st)    /* 0x20..0x2F, 0x32.
     slot_skip(s);
     d[0] = in[2]; return 1;
   case 0x2E: if (in[2] != 0xFF) defer_decode = in[2]; d[0] = defer_decode; return 1;   /* deferred decode */
-  case 0x2D:                                                /* timing: [adaptive 0/1, 0xFF keeps] */
-    if (in[2] != 0xFF) adaptive = in[2];
+  case 0x2D:                                                /* timing: [mode 0, 1, 3; 0xFF keeps] */
+    if (in[2] != 0xFF) {
+      if (in[2] > 3 || in[2] == 2) { *st = 2; return 1; }
+      tmode_req = in[2];
+    }
     put32(d, period_us); put32(d + 4, slot_us); put32(d + 8, ex_budget);
-    put32(d + 12, ex_n ? ex_sum / ex_n : 0); put32(d + 16, ex_max); d[20] = adaptive; d[21] = max_resp;
+    put32(d + 12, ex_n ? ex_sum / ex_n : 0); put32(d + 16, ex_max); d[20] = tmode_req; d[21] = max_resp;
     put32(d + 22, dec_n ? dec_sum / dec_n : 0); put32(d + 26, dec_max);
     d[30] = sizing.worst; d[31] = sizing.big; d[32] = (uint8_t)sizing_base(plan_n); d[33] = (uint8_t)plan_n;
     for (int k = 0; k < DML_SLOTS; k++) d[34 + k] = sizing.pct[k];   /* saturation: worst, large answers, normal size, devices, per slot */
+    d[44] = tmode;                                          /* 20: mode requested; 44: in effect */
     ex_sum = ex_n = ex_max = dec_sum = dec_n = dec_max = 0;
     return 1;
   case 0x37:                                                /* packed stream reports on/off (0x82) */
