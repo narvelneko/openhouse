@@ -19,8 +19,10 @@ constexpr uint16_t kVid = 0x6767, kPid = 0x0727;
 // Commands (doorman/dongle-fw/src/dongle.h, link.c)
 constexpr uint8_t kInfo = 0x01, kBootloader = 0x10, kReset = 0x12, kClearCrash = 0x14, kLink = 0x20, kDown = 0x21,
                   kScan = 0x22, kStats = 0x23, kPair = 0x24, kSlotsCmd = 0x25, kForget = 0x26, kChannels = 0x27,
-                  kCodec = 0x28, kLive = 0x29, kIdent = 0x2A, kTiming = 0x2D, kSetName = 0x34, kGetName = 0x35;
+                  kCodec = 0x28, kLive = 0x29, kIdent = 0x2A, kTiming = 0x2D, kSetName = 0x34, kGetName = 0x35,
+                  kRepeaters = 0x3C, kSatStatus = 0x3D, kRelayStats = 0x3E, kRole = 0x3F;
 constexpr size_t kNameMax = 59;  // what the dongle keeps (link.c DML_NAME_MAX)
+constexpr uint8_t kKeep = 0xFF;   // 0x2D, 0x3F: read, change nothing
 
 hid_device* H(void* p) { return static_cast<hid_device*>(p); }
 uint32_t Rd32(const uint8_t* p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
@@ -299,19 +301,7 @@ void Dongle::Poll(double now) {
     nextSlow_ = now + 1.0;
     {
       const uint8_t keep = 0xFF;   // read only: leaves the adaptive timing as it is
-      if (Command(kTiming, &keep, 1, &r) && r.data.size() >= 42) {
-        const uint8_t* d = r.data.data();
-        std::lock_guard lock(mutex_);
-        state_.haveTiming = true;
-        state_.cycleUs = Rd32(d);
-        state_.slotUs = Rd32(d + 4);
-        state_.answerBytes = d[21];
-        const bool sizing = state_.firmware >= 0x0028;
-        state_.normalAnswerBytes = sizing ? d[32] : 0;
-        state_.saturationPercent = sizing ? d[30] : -1;
-        state_.largeAnswers = sizing && d[31];
-        for (int i = 0; i < kSlots; ++i) state_.slots[i].saturationPercent = sizing ? d[34 + i] : -1;
-      }
+      if (Command(kTiming, &keep, 1, &r) && r.data.size() >= 42) TakeTiming(r.data.data(), now);
     }
     if (Command(kInfo, nullptr, 0, &r) && std::memcmp(r.data.data(), "OHDG", 4) == 0) {
       const uint8_t* d = r.data.data();
@@ -324,6 +314,17 @@ void Dongle::Poll(double now) {
       state_.watchdog = d[7];
       state_.resetReason = Rd32(d + 12);
       state_.uptimeMs = Rd32(d + 16);
+      // Uptime went back: it restarted under our handle (a reset normally re-enumerates it, and the
+      // manager makes a new Dongle): its timing mode is back to the default, so restore the pinned one.
+      if (lastUptime_ > 2000 && state_.uptimeMs < lastUptime_ - 2000) {   // no u32 wrap near 49 days
+        applyPending_ = true;
+        applyTries_ = 0;
+        nextTiming_ = 0;
+        rep_.have = false;   // its counters restarted too
+        state_.haveTiming = false;
+        probed_ = false;
+      }
+      lastUptime_ = state_.uptimeMs;
       state_.crashCount = Rd32(d + 28);
       state_.crashType = Rd32(d + 32);
       state_.crashPc = Rd32(d + 36);
@@ -351,7 +352,9 @@ void Dongle::Poll(double now) {
       state_.channelMask = uint16_t(r.data[0] | r.data[1] << 8);
       for (int k = 0; k < kHops; ++k) { state_.hopChannel[k] = r.data[2 + k]; state_.hopLoss[k] = r.data[18 + k]; }
       state_.joinsHeard = Rd32(r.data.data() + 34);
+      state_.netBase = Rd32(r.data.data() + 38);
     }
+    if (!probed_) ProbeFeatures();
     const uint8_t keep = 0xFF;
     if (Command(kLink, &keep, 1, &r)) { std::lock_guard lock(mutex_); state_.linkOn = r.data[0]; }
     // names, kept on the dongle (0x0025+): every paired slot's, once a second
@@ -400,6 +403,8 @@ void Dongle::Poll(double now) {
       if (s.active) state_.kBytesPerSec += s.kBytesPerSec;
     }
   }
+  PollTiming(now);
+  PollRepeater(now);
   if (now >= nextStats_) {  // every paired slot's counters once a second, all together
     nextStats_ = now + 1.0;
     for (int slot = 0; slot < kSlots; ++slot) {
@@ -459,6 +464,205 @@ void Dongle::PollStats(int slot, double now) {
     k.devReplyDrops = uint16_t(Rd32(c.data.data() + 16));
   }
   k.imu0 = k.imu; k.light0 = k.light; k.input0 = k.input;
+}
+
+// ---- timing mode (0x2D) and repeaters (0x3C-0x3F) ----
+// 0x2D is read with the other slow reads every second, and every 0.5 s for up to 10 s after this app set a
+// mode. A pinned mode is written once at connect / after a reset (never to a dongle in the repeater role).
+// Commands go through Command() (seq 128..255); a failed read is tried again at its next time.
+
+void Dongle::Note(const std::string& text, bool error) {
+  std::lock_guard lock(mutex_);
+  state_.timingNote = text;
+  state_.timingNoteError = error;
+  state_.timingNotes++;
+}
+
+bool Dongle::ReadTiming(uint8_t mode, double now) {
+  Reply r;
+  if (!Command(kTiming, &mode, 1, &r)) return false;
+  TakeTiming(r.data.data(), now);
+  return true;
+}
+
+// A 0x2D reply: the link timing, answer sizing, and (firmware with timing modes) the mode.
+void Dongle::TakeTiming(const uint8_t* d, double now) {
+  std::lock_guard lock(mutex_);
+  state_.haveTiming = true;
+  state_.timingTime = now;
+  state_.cycleUs = Rd32(d);
+  state_.slotUs = Rd32(d + 4);
+  state_.exAvgUs = Rd32(d + 12);
+  state_.exMaxUs = Rd32(d + 16);
+  state_.answerBytes = d[21];
+  const bool sizing = state_.firmware >= 0x0028;
+  state_.normalAnswerBytes = sizing ? d[32] : 0;
+  state_.saturationPercent = sizing ? d[30] : -1;
+  state_.largeAnswers = sizing && d[31];
+  for (int i = 0; i < kSlots; ++i) state_.slots[i].saturationPercent = sizing ? d[34 + i] : -1;
+  if (!state_.extras) return;
+  state_.modeRequested = d[20];
+  state_.modeNow = d[44];
+  // confirmed; or someone else (another tool) has asked for another mode since
+  if (state_.modeTarget >= 0 && (state_.modeNow == state_.modeTarget || state_.modeRequested != state_.modeTarget)) state_.modeTarget = -1;
+}
+
+// Firmware without timing modes and repeaters answers 0x3F with status 1 (unknown command).
+void Dongle::ProbeFeatures() {
+  Reply r;
+  Command(kRole, &kKeep, 1, &r);
+  if (r.status < 0) return;   // no answer: ask again next time
+  probed_ = true;
+  std::lock_guard lock(mutex_);
+  state_.extras = r.status == 0;
+}
+
+void Dongle::PollTiming(double now) {
+  bool extras, haveRole, repeater;
+  {
+    std::lock_guard lock(mutex_);
+    extras = state_.extras;
+    haveRole = state_.haveRole;
+    repeater = state_.haveRole && (state_.role == 1 || state_.roleRunning == 1);
+  }
+  if (!extras) return;
+  if (now < confirmUntil_ && now >= nextTiming_) {   // after a mode change: every 0.5 s until it's in effect
+    nextTiming_ = now + 0.5;
+    if (ReadTiming(kKeep, now)) {
+      std::lock_guard lock(mutex_);
+      if (state_.modeTarget < 0) confirmUntil_ = 0;
+    }
+  }
+  // Connected, or back from a reset: the dongle runs mode 3; write the pinned mode once. A mode set later by
+  // another tool is left alone. A repeater follows its main's cycle: the pin waits until it's a normal dongle
+  // again (and for the first role read).
+  if (repeater) {
+    applyTries_ = 0;
+    wasRepeater_ = true;
+  } else if (wasRepeater_ && haveRole) {
+    wasRepeater_ = false;
+    applyPending_ = true;
+  }
+  if (!applyPending_ || keepMode_ == -2 || !haveRole || repeater) return;
+  const int keep = keepMode_;
+  if (!TimingModeOffered(keep)) { applyPending_ = false; return; }
+  const std::string who = ShortSerial(serial_);
+  if (ReadTiming(uint8_t(keep), now)) {   // (the reply's mode in effect is still the one before)
+    applyPending_ = false;
+    bool changed;
+    {
+      std::lock_guard lock(mutex_);
+      changed = state_.modeNow != keep;
+      state_.modeTarget = changed ? keep : -1;
+    }
+    confirmUntil_ = now + 10;
+    nextTiming_ = now + 0.5;
+    if (changed) Note(who + ": pinned mode " + std::to_string(keep) + " restored", false);
+  } else if (++applyTries_ >= 3) {
+    applyPending_ = false;
+    Note(who + ": pinned mode not restored. No answer from dongle.", true);
+  }
+}
+
+// Every second: 0x3F (role), then on a main 0x3E pages 0 and 1, on a repeater 0x3D pages 0 and 1. Totals only.
+void Dongle::PollRepeater(double now) {
+  bool fw;
+  { std::lock_guard lock(mutex_); fw = state_.extras; }
+  if (!fw || now < nextRepeater_) return;
+  nextRepeater_ = now + 1.0;
+  Reply r;
+  if (!Command(kRole, &kKeep, 1, &r)) return;
+  const int role = r.data[0], running = r.data[11];
+  {
+    std::lock_guard lock(mutex_);
+    state_.haveRole = true;
+    state_.role = role;
+    state_.roleRunning = running;
+    state_.satId = r.data[1] < kMaxRepeaters ? r.data[1] : 0;   // the UI shifts by it
+    state_.mainBase = Rd32(r.data.data() + 2);
+    state_.netBase = Rd32(r.data.data() + 6);
+    state_.satMask = r.data[10];
+  }
+  RepCounters c;
+  c.t = now;
+  c.running = running;
+  // no rates over a role change: the other role's counters aren't these
+  const double dt = rep_.have && rep_.running == running ? now - rep_.t : 0;
+  const auto rate = [&](uint32_t a, uint32_t b) { return dt > 0 ? double(a - b) / dt : 0.0; };
+  if (running == 0) {   // a main: what its repeaters bring
+    const uint8_t p0[2] = {0, 0}, p1[2] = {1, 0}, p2[2] = {1, 4};
+    Reply a, b0, b1;
+    if (!Command(kRelayStats, p0, 2, &a) || !Command(kRelayStats, p1, 2, &b0) || !Command(kRelayStats, p2, 2, &b1)) return;
+    for (int k = 0; k < kMaxRepeaters; ++k)
+      for (int j = 0; j < 3; ++j) c.sat[k][j] = Rd32(a.data.data() + 1 + 16 * k + 4 * j);   // asked, SREPs, taken
+    const auto entry = [&](int i) { return (i < 6 ? b0 : b1).data.data() + 1 + 9 * (i < 6 ? i : i - 4); };   // 0-5, 4-9
+    for (int i = 0; i < kSlots; ++i) {
+      const uint8_t* e = entry(i);
+      for (int j = 0; j < 2; ++j) c.slot[i][j] = Rd32(e + 4 * j);   // relayed, taken
+    }
+    std::lock_guard lock(mutex_);
+    state_.reserveUs = a.data[34] | a.data[35] << 8;
+    for (int k = 0; k < kMaxRepeaters; ++k) {
+      auto& s = state_.relaySats[k];
+      s.msSinceSrep = Rd32(a.data.data() + 1 + 16 * k + 12);
+      s.asksPerSec = rate(c.sat[k][0], rep_.sat[k][0]);
+      s.srepsPerSec = rate(c.sat[k][1], rep_.sat[k][1]);
+      s.acceptedPerSec = rate(c.sat[k][2], rep_.sat[k][2]);
+    }
+    for (int i = 0; i < kSlots; ++i) {
+      const uint8_t rssi = entry(i)[8];
+      state_.relaySatRssi[i] = rssi ? -int(rssi) : 0;
+      state_.relayRelayedPerSec[i] = rate(c.slot[i][0], rep_.slot[i][0]);
+      state_.relayAcceptedPerSec[i] = rate(c.slot[i][1], rep_.slot[i][1]);
+    }
+  } else {              // a repeater on USB: its own view
+    const uint8_t p0 = 0, p1 = 1;
+    Reply a, b;
+    if (!Command(kSatStatus, &p0, 1, &a) || !Command(kSatStatus, &p1, 1, &b)) return;
+    const uint8_t* d = a.data.data();
+    c.me[0] = Rd32(d + 4); c.me[1] = Rd32(d + 8); c.me[2] = Rd32(d + 12);
+    for (int i = 0; i < kSlots; ++i) c.heard[i] = Rd32(b.data.data() + 1 + 4 * i);
+    std::lock_guard lock(mutex_);
+    state_.satSynced = d[1];
+    state_.satChannel = d[3];
+    state_.satMainRssi = d[16] ? -int(d[16]) : 0;
+    for (int i = 0; i < kSlots; ++i) state_.satHeardRssi[i] = b.data[41 + i] ? -int(b.data[41 + i]) : 0;
+    state_.satCyclesPerSec = rate(c.me[0], rep_.me[0]);
+    state_.satNeedsPerSec = rate(c.me[1], rep_.me[1]);
+    state_.satSrepsPerSec = rate(c.me[2], rep_.me[2]);
+    for (int i = 0; i < kSlots; ++i) state_.satHeardPerSec[i] = rate(c.heard[i], rep_.heard[i]);
+  }
+  c.have = true;
+  rep_ = c;
+}
+
+void Dongle::SetRole(int role, int satId, uint32_t mainBase, Done done) {
+  Queue([=, this] {
+    uint8_t a[6] = {uint8_t(role), uint8_t(satId)};
+    std::memcpy(a + 2, &mainBase, 4);
+    Reply r;
+    if (!Command(kRole, a, sizeof a, &r)) { if (done) done(false, "the dongle refused the role"); return; }
+    {
+      std::lock_guard lock(mutex_);
+      state_.role = r.data[0];
+      state_.satId = r.data[1] < kMaxRepeaters ? r.data[1] : 0;
+      state_.mainBase = Rd32(r.data.data() + 2);
+    }
+    rep_.have = false;
+    nextRepeater_ = 0;
+    if (done) done(true, role ? "Now a repeater (id " + std::to_string(satId) + ")" : "Back to a normal dongle");
+  });
+}
+
+void Dongle::SetRepeaters(uint8_t mask, bool save, Done done) {
+  Queue([=, this] {
+    Reply r;
+    const uint8_t a[2] = {mask, uint8_t(save ? 1 : 0)};
+    if (!Command(kRepeaters, a, 2, &r)) { if (done) done(false, "the dongle refused"); return; }
+    { std::lock_guard lock(mutex_); state_.satMask = r.data[0]; }
+    nextRepeater_ = 0;
+    if (done) done(true, mask ? "Repeater use on" : "Repeater use off");
+  });
 }
 
 void Dongle::Run() {
@@ -603,6 +807,23 @@ void Dongle::BankUpdate(std::vector<uint8_t> image, std::function<void(float)> p
     }
     if (!Command(lh::dongle_bank::kCommit, nullptr, 0, &r, 2000) || r.status) { if (done) done(false, "the new firmware didn't check out"); return; }
     if (done) done(true, "Done: the dongle restarts with the new firmware");
+  });
+}
+
+void Dongle::SetTimingMode(int mode, Done done) {
+  Queue([=, this] {
+    bool fw;
+    { std::lock_guard lock(mutex_); fw = state_.extras; }
+    if (!fw) { if (done) done(false, "this dongle firmware has no timing modes"); return; }
+    const double now = Now();
+    if (!ReadTiming(uint8_t(mode), now)) { if (done) done(false, "no answer from dongle"); return; }
+    {
+      std::lock_guard lock(mutex_);
+      state_.modeTarget = state_.modeNow == mode ? -1 : mode;   // byte 44 is still the old mode: confirm later
+    }
+    confirmUntil_ = now + 10;
+    nextTiming_ = now + 0.5;
+    if (done) done(true, "Mode " + std::to_string(mode) + " set");
   });
 }
 

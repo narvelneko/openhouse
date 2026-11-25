@@ -76,8 +76,29 @@ POLL  [01][slot][flags: ack 0-2, dseq 3, down 4][cycle][mask lo][mask hi][period
 RESP  [02][slot][flags: seq 0-2, dack 3][rssi -dBm][missed u8][crc_err u8][frames]
 JOIN  [03][net base x4][flags: pairing 0][assign id x8][assign slot]
 JREQ  [04][device id x8][flags]
+NEED  [06][sat id][next cycle][mask lo][mask hi][period/50us][us to next start u16][listen u16][wanted u16][max len][flags][seqs]
+SREP  [07][sat id][cycle][heard u16][-dBm per heard slot][records: [slot | 0x80 if older][n][RESP]...]
 frames = repeated [len][frame]
 ```
+NEED / SREP are dongle to dongle only (repeater dongles, firmware 0x0031; `doorman_link.h`), at base
+`net base ^ 0x80808080`, prefix `0xC0 + sat id`. A repeater follows the main's hop and keeps the last two
+RESPs it heard from each slot; after the device slots the main asks each repeater in use for the answers it's
+missing (NEED) and takes the relayed ones (SREP) through the same path as direct ones, so it stays the only
+one that acks and decodes. Relaying works with the selective ack (`DML_F_SACK`):
+* An answer lost at the main and relayed in the same cycle is taken before the next POLL: the device never
+  resends it, and the selective ack never comes into play.
+* A slot the main holds an answer for (the one after a lost one) is still wanted: the repeater can send the
+  lost one from the cycle before (record flag 0x80), and the main then passes on both in order.
+* For each wanted slot the repeater sends the answer with the expected seq and, after it, the next one. If it
+  only has the next one, the main keeps it as the held answer, and its POLL asks the device for the lost one
+  only.
+* A record from the cycle before fills the gap only: the main takes the device's hop timing, telemetry and
+  downlink ack from answers to this cycle's POLL.
+
+While repeaters are in use every cycle is longer by a fixed reserve: 220 us per repeater plus what a full SREP
+needs beyond the join window, and the answer size is capped so the cycle stays within the 12.75 ms a POLL can
+announce. Re-poll (0x2F) is skipped while repeaters are in use. A repeater has 7 addresses for slots: with
+more than 7 devices the main names the 7 to listen to in each NEED, the ones that lost the most answers.
 
 ### Joining and pairing
 * An unjoined device answers about half of the JOIN beacons with a JREQ carrying its radio
@@ -219,8 +240,8 @@ and `doorman_link.py`. Older two-interface firmware isn't supported.
 | 0x27 | channels: mask, loss % per hop channel, joins, net base |
 | 0x28 | codec: air bytes, frame bytes, bad frames; the radio's queue drops, reply drops (u32 each); bytes 20-21: most bytes waiting for USB since the last read (u16); 22-25: test-load bytes queued (u32); 26-29 codec resyncs (u32), 30 CRC-8 on, 31 batches on |
 | 0x2B | test load `[slot mask][kB/s]`: filler `'Z'` frames queued for USB on those slots (empty ones too), as if devices sent them. `0 0` stops it. `doorman/tools/load.py dongle` |
-| 0x2C | USB inside radio exchanges `[bits, 0xFF keeps]`: 1 while the POLL goes out, 2 while listening, 4 between decoded frames. Default 3 (4 delays the next POLL: loss ~18%) |
-| 0x2D | timing `[adaptive 0/1, 0xFF keeps]`: reply period, slot, slot budget, exchange avg/max (u32 us), adaptive, max resp, decode avg/max (u32 us at 22/26); 0x0028+: 30 worst saturation %, 31 large answers, 32 normal answer size, 33 devices in the plan, 34-41 saturation % per slot; counters reset on read |
+| 0x2C | USB inside radio exchanges `[bits, 0xFF keeps]`: 1 while the POLL goes out, 2 while listening, 4 between decoded frames. Default 3 (4 delays the next POLL: loss ~18%). Timing modes 0/1 only |
+| 0x2D | timing mode `[0, 1, 3; 0xFF keeps]` (other values: status 2): 0 fixed slots, 1 adaptive slots, 3 (default, firmware 0x0031) adaptive slots with each POLL started by a timer compare, at most 64 B of downlink per POLL; reply period, slot, slot budget, exchange avg/max (u32 us), mode requested, max resp, decode avg/max (u32 us at 22/26); 0x0028+: 30 worst saturation %, 31 large answers, 32 normal answer size, 33 devices in the plan, 34-43 saturation % per slot; 0x0031+: 44 mode in effect; counters reset on read. Older firmware takes only 0/1 (adaptive off/on) |
 | 0x2E | deferred decode `[0/1, 0xFF keeps]` (default 1) |
 | 0x2F | re-poll missed slots in the same cycle `[0/1, 0xFF keeps]`, then re-polls and answered (u32). Default 0 |
 | 0x32 | ghost-follow `[0/1, 0xFF keeps]` (other values: status 2): on (0), ghost polls sent and answered (u32 at 2 / 6, since start). Default 1 |
@@ -232,6 +253,10 @@ and `doorman_link.py`. Older two-interface firmware isn't supported.
 | 0x39 | set a slot's remembered radio version (fw 0x002D+) `[slot][u32 LE]` -> `[slot]`: the installer, after updating a device it then turns off. A committed radio update (`0xF0 '['` status 0 on its way up) clears it to unknown |
 | 0x29 | live `[first]` (6 slots per reply, as 0x25): per slot `[used\|active<<1][rssi last rx][rssi last tx][min][max][channel][ms since reply u32]`. Min/max reset on read |
 | 0x2A | identity: the slot's last `H` frame (16 B, zeros if none) |
+| 0x3C | main: repeaters in use `[mask, 0xFF reads][1: also save to flash now]` -> `[mask in use][mask saved]`. Applied in RAM; saved with byte 3 = 1, or by the dongle once no device is connected (a page erase halts the radio ~85 ms). Status 2 on a repeater |
+| 0x3D | repeater status `[page]`: 0 `[role][synced][sat id][channel]`, u32 from 4: cycles, NEEDs, SREPs; `[main -dBm at 16]`. 1: per slot RESPs heard (u32 x10 from 1), -dBm (x10 from 41). Totals |
+| 0x3E | main: relay stats `[page][first]`: 0 per repeater (16 B from 1+16k: asked, SREPs, taken, ms since its last SREP; u32), `[33 mask][34 reserve us u16]`. 1 `[first 0-4]`: 6 slots of 9 B: relayed, taken (u32), -dBm at the repeater. Totals; 0x23 counts an answer relayed in its own cycle as an answer |
+| 0x3F | role `[0/1, 0xFF reads][sat id 0-1][main net base u32]` -> `[role][sat id][main base u32][own net base u32][mask in use][role running]`. 1: a repeater of that main (kept in the pair page after the radio versions, applied at once; status 2 for an invalid base or its own). A repeater refuses 0x21 and 0x24. Firmware without repeaters: status 1 |
 
 ## Device frames (uplink, inside RESP)
 

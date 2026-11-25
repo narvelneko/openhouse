@@ -144,8 +144,13 @@ class DoormanDongle {
     int dongleFirmware = 0;                    // the dongle's firmware, 0 until it says
     uint32_t radio = 0;                        // the device's radio firmware (remembered by the dongle when off), 0 unknown
     bool dongleOld = false, radioOld = false;  // older than the firmware this driver came with
+    // On a main with repeaters in use (else -1): answers per second taken from a repeater, their share of the
+    // slot's answers, and the loss there would be without them (lossPercent is the loss with them).
+    double viaRepeaterPerSec = -1, viaRepeaterPercent = -1, lossAlonePercent = -1;
   };
   std::vector<SlotStat> SlotStats() const;
+  // The dongle's repeater role and status (role -1: firmware without repeaters). Safe from any thread.
+  DoormanRepeaterStatus Repeater() const;
 
  private:
   struct Slot {
@@ -175,7 +180,8 @@ class DoormanDongle {
     // link stats: last raw 0x23 counters and the rates derived from them
     bool haveStats = false; double statsT = 0;
     uint32_t polls = 0, respOk = 0, framesUp = 0, bytesUp = 0, drops = 0;
-    double kBps = 0, fps = 0, loss = -1, dps = 0; int rssiD = 0, rssiT = 0;
+    double kBps = 0, fps = 0, loss = -1, dps = 0, pollsPs = 0, okPs = 0; int rssiD = 0, rssiT = 0;
+    double relayedPs = -1, takenPs = -1;   // 0x3E page 1, per second: answers relayed by a repeater, and taken
     std::array<uint32_t, 15> raw{};   // the last 0x23 reply as is
     // Silent while connected: data stopped but the slot still answers. Logged (with the radio's own
     // status) and then made to rejoin, so the cause shows in the log.
@@ -209,6 +215,13 @@ class DoormanDongle {
   int FeatureRead(int slot, uint8_t* data, size_t size);  // worker thread
   void Downlink(int slot, const uint8_t* frame, size_t n);
   void RefreshStatsCache();
+  void PollRepeater(double now);
+  void OnRepeaterReply(double t, uint8_t cmd, int kind, const uint8_t* d);
+  // Turns u32 totals into per-second rates since the same page's previous reply. No rates (false) the first
+  // time, when a total went down (the dongle restarted, or a repeater was newly turned on), or when the role
+  // changed.
+  struct Totals { bool have = false; int role = -1; double t = 0; std::array<uint32_t, 16> v{}; };
+  bool Rates(Totals& last, double t, const uint32_t* v, int n, double* rates);
 
   const std::string serial_;
   IInputSink* sink_;
@@ -273,6 +286,17 @@ class DoormanDongle {
   int pairSlot_ = -1;
   std::vector<EndpointInfo> eps_;
   std::vector<SlotStat> statsCache_;   // under mutex_
+  // Repeaters (dongle firmware 0x0031+): 0x3F is probed once after the dongle opens; if it answers status 1
+  // (upstream firmware), nothing more is sent. The role is read again after a restart or role change, and the
+  // status every second.
+  int repFw_ = -1, roleTries_ = 0, roleSeq_ = -1;   // repFw_: -1 not known yet, 0 no, 1 answers 0x3F
+  bool readRole_ = true;
+  std::array<int, 3> repSeq_{-1, -1, -1};           // pending seq: 0x3D p0; 0x3E p0 or 0x3D p1; 0x3E p1
+  int relayFirst_ = 0;                              // first slot of the last 0x3E page 1 request: 0 or 4
+  double nextRep_ = 0;
+  DoormanRepeaterStatus rep_;                       // the reader thread's
+  Totals satTotals_, slotTotals_[2], heardTotals_;
+  DoormanRepeaterStatus repCache_;                  // copy for other threads, under mutex_
 };
 
 }  // namespace lh::usb

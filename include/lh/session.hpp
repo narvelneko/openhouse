@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "lh/log_level.hpp"
+#include "lh/types.hpp"
 
 namespace lh {
 
@@ -312,8 +313,13 @@ class Session {
     int firmware = 0;            // openhouse: the dongle's firmware, 0 unknown
     uint32_t radio = 0;          // openhouse: the slot's device radio firmware, 0 unknown
     bool firmwareOld = false, radioOld = false;   // older than what this driver came with
+    // openhouse, on a main with repeaters in use (else -1): answers per second taken from a repeater, their
+    // share of the slot's answers, and the loss there would be without them (lossPercent is with them)
+    double viaRepeaterPerSec = -1, viaRepeaterPercent = -1, lossAlonePercent = -1;
   };
   virtual std::vector<Receiver> Receivers() const = 0;
+  // openhouse: the role and repeater status of each Doorman Dongle whose firmware has repeaters.
+  virtual std::vector<DoormanRepeaterStatus> DoormanDongles() const { return {}; }
   // Stores a name on an openhouse slot ("OHDG-.../3"); false if there's no such slot.
   virtual bool SetReceiverName(const std::string& receiver, const std::string& name) = 0;
   // Pairing mode on a receiver for `seconds` (0 leaves it); false if not plugged in.

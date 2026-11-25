@@ -15,7 +15,8 @@
 
 volatile uint32_t ms_ticks;
 NRF_RADIO_Type stub_radio;
-NRF_TIMER_Type stub_timer1;
+NRF_TIMER_Type stub_timer1, stub_timer2, stub_timer3;
+NRF_PPI_Type stub_ppi;
 NRF_CLOCK_Type stub_clock;
 NRF_FICR_Type stub_ficr;
 NRF_NVMC_Type stub_nvmc;
@@ -25,7 +26,7 @@ static int fails, checks;
 
 static uint32_t rs = 0x9E3779B9u;
 static uint32_t rnd(void) { rs ^= rs << 13; rs ^= rs >> 17; rs ^= rs << 5; return rs; }
-static int popc(uint16_t m) { int n = 0; while (m) { n += m & 1; m >>= 1; } return n; }
+/* popc: link.c's own (included above) */
 
 /* ---- master's rule (f4269bb link.c, channels_typical_loss / channels_eval), on its own state ---- */
 static struct { uint16_t polls, lost; uint32_t off_until_ms; uint8_t loss_pct, strikes; } rc[DML_NHOP];

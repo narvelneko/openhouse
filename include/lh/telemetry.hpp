@@ -18,6 +18,14 @@
 //                       "coverage":[{"base","frames","sensors"}],"basesSeen":N}],
 //           "receivers":[{"serial","connected", Doorman slots: "firmware","firmwareOld" (the dongle's),
 //                         "radio","radioOld" (the device's radio; Old: older than the driver's)}],
+//             a Doorman slot ("<dongle>/<slot>") also "slot","paired","linked","loss","drops","rssi":[dongle,device],
+//             and on a main with repeaters in use "viaRepeater" (answers/s taken from a repeater),
+//             "viaRepeaterShare" (% of its answers), "lossAlone" (% loss without the repeater; "loss" is with it)
+//           "dongles":[{"serial","role":"main"|"repeater","netBase":"hex"}]  only Doorman Dongles whose
+//             firmware has repeaters. main: "repeaterMask", "repeaters":[{"id","answering","lastAnswer" (s, -1 never),
+//             "asksPerSec","answersPerSec"}] (one per id in use). repeater: "repeaterId","mainBase":"hex",
+//             "main" (the main's serial when plugged in here, else ""),"following","mainRssi",
+//             "heard":[{"slot","perSec","rssi"}] (the main's slots it hears)
 //           "settings":{"positionSmoothingMs","rotationSmoothingMs","predictWithAcceleration",
 //                       "hideLostDevices","mixedLight","mixedLight...","host","steamvr",
 //                       "recording","recordingPath","reportBusy","report":{"count","path","error"},"steamRooms",

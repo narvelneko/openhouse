@@ -31,7 +31,7 @@
  *        batches (doorman_lh2p.h: every frame queued for an answer coded together, LH2 light predicted)
  * frames = repeated [len][len bytes]: exactly the frames the tracker MCU and its radio exchange over SPI.
  *
- * Repeater dongles (called satellites in the code), dongle firmware 0x002F. These go only between dongles;
+ * Repeater dongles (called satellites in the code), dongle firmware 0x0031. These go only between dongles;
  * device radios never receive them, because their address base, DML_SAT_BASE(net base), is no slot or join
  * address. Slot masks are u16, bit = slot.
  * NEED  [06][sat id][next cycle][mask lo][mask hi][period/50us][us from this ADDRESS to the next cycle's

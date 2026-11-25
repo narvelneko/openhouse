@@ -221,9 +221,14 @@ class SessionImpl final : public Session, public InputSinkBase {
         o.devicesOnDongle = r.devicesOnDongle;
         o.name = r.name; o.keepsName = r.keepsName;
         o.firmware = r.firmware; o.radio = r.radio; o.firmwareOld = r.firmwareOld; o.radioOld = r.radioOld;
+        o.viaRepeaterPerSec = r.viaRepeaterPerSec; o.viaRepeaterPercent = r.viaRepeaterPercent;
+        o.lossAlonePercent = r.lossAlonePercent;
         out.push_back(o);
       }
     return out;
+  }
+  std::vector<DoormanRepeaterStatus> DoormanDongles() const override {
+    return usb_ ? usb_->DoormanRepeaters() : std::vector<DoormanRepeaterStatus>();
   }
   bool SetCapture(const std::string& path) override {
 #ifdef LH_RUNTIME_USB

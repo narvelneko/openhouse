@@ -24,6 +24,17 @@ constexpr int kSlots = 10;   // the most a dongle has; DongleState::slotCount is
 constexpr int kHops = 16;
 constexpr int kHistory = 120;  // samples kept for the graphs (one a second: two minutes)
 
+// Timing modes (cmd 0x2D) and repeater dongles (cmds 0x3C-0x3F) are in firmware that answers cmd 0x3F; the
+// worker asks each dongle (DongleState::extras). The dongle starts in timing mode 3 after every reset.
+constexpr int kMaxRepeaters = 2;
+constexpr int kDefaultTimingMode = 3;
+constexpr int kJoinWindowUs = 700;   // the cycle's join window (protocol.md: period = n * slot_us + 700 us)
+// The modes the app offers: 3 (the default) and 1 (upstream's behaviour, for troubleshooting). Another mode
+// (0, set by another tool) shows as Custom and isn't offered; a pin on it is ignored.
+inline bool TimingModeOffered(int mode) { return mode == 1 || mode == kDefaultTimingMode; }
+// A dongle's serial, short: the 8 hex digits after "OHDG-".
+inline std::string ShortSerial(const std::string& s) { return s.rfind("OHDG-", 0) == 0 ? s.substr(5, 8) : s.substr(0, 8); }
+
 // What a device on a slot is, as far as anyone knows.
 struct Identity {
   std::string serial;  // "LHR-0AC3E7C8"
@@ -92,6 +103,37 @@ struct DongleState {
   std::vector<uint8_t> scan;
   int scanFirst = 0;
   double scanTime = 0;
+  // firmware with timing modes and repeaters (it answers 0x3F), asked again after a reset
+  bool extras = false;
+  // timing mode (0x2D, read with the link timing above)
+  int modeRequested = -1, modeNow = -1;   // byte 20, byte 44 (in effect: changes at a cycle's start)
+  uint32_t exAvgUs = 0, exMaxUs = 0;
+  double timingTime = 0;                  // host time of the last 0x2D read
+  int modeTarget = -1;                    // a mode this app set, not yet confirmed in effect (-1: none)
+  // what the app did by itself (restored the pinned mode), for a toast: the count goes up per note
+  int timingNotes = 0;
+  std::string timingNote;
+  bool timingNoteError = false;
+  // repeater (read every second; nothing in these reads resets anything)
+  uint32_t netBase = 0;                // its own network base (0x27 bytes 38-41)
+  bool haveRole = false;
+  int role = 0, roleRunning = 0;       // 0 main, 1 repeater (stored / running)
+  int satId = 0;                       // repeater: its id
+  uint32_t mainBase = 0;               // repeater: the main's network base
+  uint8_t satMask = 0;                 // main: the repeater ids it asks
+  int reserveUs = 0;                   // main: cycle time kept for the repeaters now
+  // main: per repeater id, rates over the last second
+  struct RelaySat { double asksPerSec = 0, srepsPerSec = 0, acceptedPerSec = 0; uint32_t msSinceSrep = 0xFFFFFFFF; };
+  std::array<RelaySat, kMaxRepeaters> relaySats{};
+  // main: per slot, over the last second: answers relayed by a repeater, and taken in order
+  std::array<double, kSlots> relayRelayedPerSec{}, relayAcceptedPerSec{};
+  std::array<int, kSlots> relaySatRssi{};   // dBm at the repeater (its last SREP), 0 none
+  // repeater (on USB): its own status
+  bool satSynced = false;
+  int satChannel = 0, satMainRssi = 0;
+  double satCyclesPerSec = 0, satNeedsPerSec = 0, satSrepsPerSec = 0;
+  std::array<double, kSlots> satHeardPerSec{};
+  std::array<int, kSlots> satHeardRssi{};
 };
 
 class Dongle {
@@ -124,6 +166,18 @@ class Dongle {
   void SetName(int slot, std::string name, Done done);
   // Names learned elsewhere (the driver's telemetry, the remembered list), by pairing id.
   void SetKnown(const std::string& pairId, const Identity& id);
+  // Timing mode (0x2D): sets it; the mode in effect is confirmed from byte 30 at the next reads.
+  void SetTimingMode(int mode, Done done);
+  // The mode kept for this dongle (-1: none): re-applied when it connects or comes back from a reset,
+  // if its firmware has it. The worker waits for the first call before deciding at connect.
+  void SetKeepMode(int mode) { keepMode_ = mode; }
+  // The Timing page is showing this dongle: call every frame. 0x2D is read only while it does.
+  // Repeater (0x3F/0x3C): this dongle's role (1: a repeater of the main whose network base is given, as
+  // repeater id satId; 0: back to a normal dongle), and on a main the repeater ids it asks.
+  void SetRole(int role, int satId, uint32_t mainBase, Done done);
+  // save: also into the dongle's flash now (a page erase halts its radio ~85 ms: set-up only). Without it
+  // the mask is in RAM at once and saved by the dongle once nothing is connected.
+  void SetRepeaters(uint8_t mask, bool save, Done done);
 
  private:
   struct Reply { int status = -1; std::array<uint8_t, 61> data{}; };
@@ -139,6 +193,11 @@ class Dongle {
   bool FeatureRead(int slot, uint8_t* data, size_t size);
   void Queue(std::function<void()> action);
   void Ident(int slot);
+  void PollTiming(double now);
+  void PollRepeater(double now);
+  bool ReadTiming(uint8_t mode, double now);   // 0x2D [mode]; 0xFF: keep (read)
+  void TakeTiming(const uint8_t* d, double now);
+  void Note(const std::string& text, bool error);
 
   const std::string path_, serial_;
   static constexpr int kInterfaces = 5;   // interface 0: commands; slot s streams on interface s % 5 (s % 4 before fw 0x002B)
@@ -181,6 +240,19 @@ class Dongle {
   std::vector<uint8_t> waitReply_;
   bool waitDone_ = false;
   double nextLive_ = 0, nextSlow_ = 0, nextStats_ = 0;
+  // timing mode
+  std::atomic<int> keepMode_{-2};             // -2: the UI hasn't said yet
+  double nextTiming_ = 0, confirmUntil_ = 0;
+  bool applyPending_ = true;                  // connected (or reset): re-apply the kept mode once
+  bool wasRepeater_ = false;                  // was in the repeater role: re-apply when back to normal
+  int applyTries_ = 0;
+  uint32_t lastUptime_ = 0;
+  bool probed_ = false;                       // extras asked (again after a reset)
+  void ProbeFeatures();
+  // repeater counters (0x3D / 0x3E totals), for the rates
+  struct RepCounters { bool have = false; int running = 0; double t = 0; uint32_t sat[kMaxRepeaters][3]{}; uint32_t slot[kSlots][2]{}; uint32_t me[3]{}; uint32_t heard[kSlots]{}; };
+  RepCounters rep_;
+  double nextRepeater_ = 0;
 };
 
 // Every Doorman Dongle plugged in, found again every two seconds.

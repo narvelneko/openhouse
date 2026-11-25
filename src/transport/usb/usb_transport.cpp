@@ -662,11 +662,27 @@ std::vector<UsbTransport::Receiver> UsbTransport::Receivers() const {
       r.paired = st.used;
       r.name = st.name; r.keepsName = st.haveName;
       r.firmware = st.dongleFirmware; r.radio = st.radio; r.firmwareOld = st.dongleOld; r.radioOld = st.radioOld;
+      r.viaRepeaterPerSec = st.viaRepeaterPerSec; r.viaRepeaterPercent = st.viaRepeaterPercent;
+      r.lossAlonePercent = st.lossAlonePercent;
       slots.push_back(r);
     }
   }
   std::stable_sort(slots.begin(), slots.end(), [](const auto& a, const auto& b) { return !a.paired && b.paired; });
   out.insert(out.end(), slots.begin(), slots.end());
+  return out;
+}
+
+std::vector<DoormanRepeaterStatus> UsbTransport::DoormanRepeaters() const {
+  std::vector<DoormanRepeaterStatus> out;
+  for (const auto& dongle : DoormanDongles()) {
+    auto rep = dongle->Repeater();
+    if (rep.role < 0) continue;
+    rep.serial = dongle->Serial();
+    out.push_back(std::move(rep));
+  }
+  for (auto& rep : out)   // each repeater's main, if it's plugged in here too
+    for (const auto& m : out)
+      if (rep.role == 1 && m.role == 0 && m.netBase == rep.mainBase) rep.mainSerial = m.serial;
   return out;
 }
 
@@ -786,6 +802,7 @@ bool UsbTransport::SetPairing(const std::string& receiver, int milliseconds) {
     const std::string rest = receiver.substr(serial.size());
     const bool slotted = rest.size() == 2 && rest[0] == '/' && rest[1] >= '0' && rest[1] < '0' + DoormanDongle::kSlots;
     if (!rest.empty() && !slotted) continue;   // another dongle whose serial starts with this one's
+    if (dongle->Repeater().role == 1) return false;   // a repeater has no devices of its own
     return dongle->Pair(milliseconds, slotted ? rest[1] - '0' : -1);
   }
   {

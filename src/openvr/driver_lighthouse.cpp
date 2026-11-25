@@ -1623,7 +1623,8 @@ class Provider : public IServerTrackedDeviceProvider {
         lastTelemetry_ = now;
         g_telemetry.PublishState(now, snapshot_, updates, session_->Receivers(),
                                  {roomPublisher_.Settled(), roomPublisher_.Epoch(), lh::openvr::RoomSettle::kMaxSigma,
-                                  session_->RoomResets()});
+                                  session_->RoomResets()},
+                                 session_->DoormanDongles());
       }
       for (const auto& u : updates) {
         auto found = devices_.find(u.serial);

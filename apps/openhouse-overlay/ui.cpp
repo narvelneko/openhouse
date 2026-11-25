@@ -27,6 +27,7 @@ namespace {
 using json = nlohmann::json;
 using viewer::Base;
 using viewer::Device;
+using viewer::Dongle;
 using viewer::State;
 using viewer::Receiver;
 
@@ -1012,7 +1013,49 @@ void Ui::Dongles() {
     std::sort(slots.begin(), slots.end(), [](auto* a, auto* b) { return a->slot < b->slot; });
     int paired = 0, linked = 0; double kbps = 0;
     for (auto* r : slots) { paired += r->paired; linked += r->linked; kbps += r->linked ? r->kBytesPerSec : 0; }
+    const auto found = s.dongles.find(dongle);
+    const Dongle* info = found == s.dongles.end() ? nullptr : &found->second;
+    const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_SizingStretchProp |
+                                  ImGuiTableFlags_PadOuterX;
     ImGui::PushID(dongle.c_str());
+    if (info && info->role == "repeater") {   // a repeater here: its main and the slots it hears
+      const std::string main = info->main.empty() ? "network " + info->mainBase : info->main;
+      ImGui::SeparatorText(("Doorman " + dongle + ": repeater " + std::to_string(info->repeaterId) + " of " + main).c_str());
+      if (!info->following) { Dot(kWarn, em * 0.28f); ImGui::TextColored(kWarn, "Searching for the main"); }
+      else {
+        Dot(kGood, em * 0.28f);
+        if (info->mainRssi) ImGui::Text("Following the main, heard at %d dBm", info->mainRssi);
+        else ImGui::TextUnformatted("Following the main");
+      }
+      if (info->following && info->heard.empty()) ImGui::TextDisabled("Hears no devices");
+      if (!info->heard.empty() && ImGui::BeginTable("heard", 4, flags)) {
+        ImGui::TableSetupColumn("Slot", ImGuiTableColumnFlags_WidthFixed, em * 2.5f);
+        ImGui::TableSetupColumn("Device", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Signal", ImGuiTableColumnFlags_WidthFixed, em * 5.5f);
+        ImGui::TableSetupColumn("Heard", ImGuiTableColumnFlags_WidthFixed, em * 5.5f);
+        ImGui::TableHeadersRow();
+        for (const auto& h : info->heard) {
+          ImGui::TableNextRow();
+          ImGui::TableNextColumn();
+          ImGui::Text("%d", h.slot + 1);
+          ImGui::TableNextColumn();
+          std::string device;
+          for (const auto& r : s.receivers)
+            if (!info->main.empty() && r.serial == info->main + "/" + std::to_string(h.slot)) device = r.connected;
+          if (device.empty()) ImGui::TextDisabled("-");
+          else ImGui::TextUnformatted(deviceName(device).c_str());
+          ImGui::TableNextColumn();
+          if (h.rssi) ImGui::Text("%d dBm", h.rssi); else ImGui::TextDisabled("-");
+          ImGui::TableNextColumn();
+          ImGui::Text("%.0f/s", h.perSec);
+          Tip("Its answers this repeater hears");
+        }
+        ImGui::EndTable();
+      }
+      ImGui::PopID();
+      ImGui::Spacing();
+      continue;
+    }
     ImGui::SeparatorText(("Doorman " + dongle).c_str());
     ImGui::TextDisabled("%d connected, %d paired, %.1f kB/s", linked, paired, kbps);
     if (const int fw = slots.front()->firmware) {
@@ -1020,13 +1063,28 @@ void Ui::Dongles() {
       if (slots.front()->firmwareOld) ImGui::TextColored(kWarn, "Firmware %04X, needs an update", fw);
       else ImGui::TextDisabled("Firmware %04X", fw);
     }
-    const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_SizingStretchProp |
-                                  ImGuiTableFlags_PadOuterX;
-    if (ImGui::BeginTable("slots", 8, flags)) {
+    const bool repeaters = info && !info->repeaters.empty();
+    if (repeaters)
+      for (const auto& p : info->repeaters) {
+        if (p.answering) {
+          Dot(kGood, em * 0.28f);
+          ImGui::Text("Repeater %d: answering, last %.1f s ago, %.0f answers/s", p.id, p.lastAnswer, p.answersPerSec);
+        } else if (p.asksPerSec > 0) {
+          Dot(kWarn, em * 0.28f);
+          if (p.lastAnswer < 0) ImGui::TextColored(kWarn, "Repeater %d: not answering", p.id);
+          else ImGui::TextColored(kWarn, "Repeater %d: not answering (last %.0f s ago)", p.id, p.lastAnswer);
+        } else {
+          Dot(kOff, em * 0.28f);
+          ImGui::TextDisabled("Repeater %d: nothing to relay", p.id);
+          Tip("The main missed no answers lately, so it asked the repeater for none");
+        }
+      }
+    if (ImGui::BeginTable("slots", repeaters ? 9 : 8, flags)) {
       ImGui::TableSetupColumn("Slot", ImGuiTableColumnFlags_WidthFixed, em * 2.5f);
       ImGui::TableSetupColumn("Device", ImGuiTableColumnFlags_WidthStretch);
       ImGui::TableSetupColumn("Signal", ImGuiTableColumnFlags_WidthFixed, em * 8.5f);
       ImGui::TableSetupColumn("Loss", ImGuiTableColumnFlags_WidthFixed, em * 3.5f);
+      if (repeaters) ImGui::TableSetupColumn("Via repeater", ImGuiTableColumnFlags_WidthFixed, em * 6.5f);
       ImGui::TableSetupColumn("Drops", ImGuiTableColumnFlags_WidthFixed, em * 3.5f);
       ImGui::TableSetupColumn("Data", ImGuiTableColumnFlags_WidthFixed, em * 5.5f);
       ImGui::TableSetupColumn("Radio", ImGuiTableColumnFlags_WidthFixed, em * 5.5f);
@@ -1052,7 +1110,18 @@ void Ui::Dongles() {
         }
         ImGui::TableNextColumn();
         if (!r->linked || r->loss < 0) ImGui::TextDisabled("-");
-        else ImGui::TextColored(LossColor(r->loss), "%.1f%%", r->loss);
+        else {
+          ImGui::TextColored(LossColor(r->loss), "%.1f%%", r->loss);
+          if (repeaters && r->lossAlone >= 0 && ImGui::IsItemHovered())
+            ImGui::SetTooltip("After the repeater; main alone %.1f%%", r->lossAlone);
+        }
+        if (repeaters) {
+          ImGui::TableNextColumn();
+          if (!r->linked || r->viaRepeater < 0) ImGui::TextDisabled("-");
+          else if (r->viaRepeater < 0.5) ImGui::TextDisabled("0");
+          else ImGui::Text("%.0f/s (%.0f%%)", r->viaRepeater, r->viaRepeaterShare);
+          Tip("Answers the main missed and took from the repeater, and their share of the slot's answers");
+        }
         ImGui::TableNextColumn();
         if (!r->linked) ImGui::TextDisabled("-");
         else if (r->drops < 0.05) ImGui::TextDisabled("0");

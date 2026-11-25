@@ -13,6 +13,11 @@
   dongle.py crash-test 1             deliberate HardFault (tests the crash record)
   dongle.py bank-update [DIR]        update over USB: write the bank it isn't running from
                                      DIR/doorman_dongle_<board>_a.bin / _b.bin, restart into it
+  dongle.py repeater status [SECS]   a main: its repeaters, per slot loss, main alone, relayed; a repeater
+                                     (on USB): sync and what it hears (cmds 0x3C-0x3F, protocol.md)
+  dongle.py repeater set MAIN [ID]   make this dongle a repeater of the dongle MAIN (both plugged in)
+  dongle.py repeater clear           back to a normal dongle (its main, if plugged in, stops asking it)
+  dongle.py repeater use on|off [ID] on a main: ask repeater ID (default 0) or not
   DONGLE=Kuroshin dongle.py ...      with several dongles: the one whose name or serial has this
 Only touches 6767:0727 devices and UF2 drives with INFO_UF2.TXT; never Valve dongles (28de:*).
 """
@@ -23,13 +28,15 @@ VID, PID = 0x6767, 0x0727
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUILD = os.path.join(HERE, "..", "dongle-fw", "build")
 
-def open_dev():
-    want = os.environ.get("DONGLE", "")   # pick one of several: part of its name or serial
+def dongles():
     for d in hid.enumerate(VID, PID):
-        name, serial = d.get("product_string") or "", d.get("serial_number") or ""
-        if name.startswith("Doorman ") and d.get("interface_number", 0) <= 0 and (want in name or want in serial):
-            return hid.Device(path=d["path"])
-    sys.exit("dongle app not found (6767:0727 'Doorman Dongle')")
+        if (d.get("product_string") or "").startswith("Doorman Dongle") and d.get("interface_number", 0) <= 0: yield d
+
+def open_dev(want=None):
+    want = os.environ.get("DONGLE", "") if want is None else want   # with several: part of a name or serial
+    for d in dongles():
+        if want in d["product_string"] or want in (d.get("serial_number") or ""): return hid.Device(path=d["path"])
+    sys.exit(f"dongle app not found (6767:0727 'Doorman Dongle'{' ' + want if want else ''})")
 
 _seq = 0
 def cmd(h, c, args=b"", timeout=1000):
@@ -199,6 +206,81 @@ def bank_update(folder):
             pass
     sys.exit("the dongle didn't come back")
 
+u32 = lambda b, o: struct.unpack_from("<I", b, o)[0]
+
+def role(h):
+    st, r = cmd(h, 0x3F, b"\xff")
+    if st == 1: sys.exit("this dongle's firmware has no repeaters: update it")
+    return dict(role=r[0], id=r[1], main=u32(r, 2), net=u32(r, 6), mask=r[10])
+
+def main_of(base, skip):
+    """The other plugged-in dongle whose network base is base, or None."""
+    for d in dongles():
+        if d.get("serial_number") == skip: continue
+        h = hid.Device(path=d["path"])
+        st, r = cmd(h, 0x3F, b"\xff")
+        if st == 0 and u32(r, 6) == base: return h
+        h.close()
+    return None
+
+def set_mask(h, mask, save):   # save: also write to flash now (stops the radio ~85 ms: setup only)
+    st, _ = cmd(h, 0x3C, bytes([mask, 1 if save else 0]))
+    if st: sys.exit(f"the main refused repeater mask {mask:#x} ({st})")
+
+def repeater(a):
+    h = open_dev(); me = role(h); c = a[0] if a else "status"
+    if c == "set":
+        if len(a) < 2: sys.exit("repeater set MAIN [ID]")
+        m = open_dev(a[1])
+        if m.serial == h.serial: sys.exit("MAIN must be another dongle")
+        mr = role(m)
+        if mr["role"]: sys.exit("MAIN is a repeater itself")
+        rid = int(a[2]) if len(a) > 2 else next((k for k in range(2) if not mr["mask"] >> k & 1), -1)
+        if rid not in (0, 1): sys.exit("the main already uses two repeaters (give ID 0 or 1)")
+        st, _ = cmd(h, 0x3F, bytes([1, rid]) + struct.pack("<I", mr["net"]))
+        if st: sys.exit(f"the dongle refused the role ({st})")
+        set_mask(m, mr["mask"] | 1 << rid, True)
+        print(f"repeater {rid} of network {mr['net']:#010x}. Unplug it, power it from a USB charger across the room."
+              "\nLED on with a short gap each second: following the main; fast blinking: searching.")
+    elif c == "clear":
+        if me["role"] == 0: sys.exit("not a repeater")
+        cmd(h, 0x3F, bytes(6))
+        m = main_of(me["main"], h.serial)
+        if m: set_mask(m, role(m)["mask"] & ~(1 << me["id"]), True); print("a normal dongle again; its main no longer uses it")
+        else: print(f"a normal dongle again; its main isn't plugged in: run 'repeater use off {me['id']}' on it later")
+    elif c == "use":
+        if len(a) < 2 or a[1] not in ("on", "off") or me["role"]: sys.exit("repeater use on|off [ID], on a main")
+        rid = int(a[2]) if len(a) > 2 else 0
+        set_mask(h, me["mask"] & ~(1 << rid) | (1 << rid if a[1] == "on" else 0), False)
+    elif c == "status":
+        secs = float(a[1]) if len(a) > 1 else 2
+        if me["role"]:
+            read = lambda: (cmd(h, 0x3D, b"\0")[1], cmd(h, 0x3D, b"\1")[1])
+            (a0, b0), _, (a1, b1) = read(), time.sleep(secs), read()
+            r = lambda x, y, o: (u32(y, o) - u32(x, o)) / secs
+            print(f"repeater {me['id']} of network {me['main']:#010x}: " + (f"following the main on {2400 + a1[3]} MHz, main at -{a1[16]} dBm"
+                  if a1[1] else "searching for the main") + f"; per s: cycles {r(a0, a1, 4):.0f}, NEEDs {r(a0, a1, 8):.0f}, answers {r(a0, a1, 12):.0f}")
+            for i in range(10):
+                if r(b0, b1, 1 + 4 * i) >= 0.5: print(f"  slot {i}: heard {r(b0, b1, 1 + 4 * i):.0f}/s at -{b1[41 + i]} dBm")
+            return
+        read = lambda: [cmd(h, 0x3E, p)[1] for p in (b"\0", b"\1\0", b"\1\4")] + [cmd(h, 0x23, bytes([i]))[1] for i in range(10)]
+        x, _, y = read(), time.sleep(secs), read()
+        d = lambda p, o: (u32(y[p], o) - u32(x[p], o)) / secs
+        print(f"main, network {me['net']:#010x}, repeaters in use {me['mask']:#x}, time reserved for them per cycle {y[0][34] | y[0][35] << 8} us")
+        for k in range(2):
+            o = 1 + 16 * k; ms = u32(y[0], o + 12)
+            if me["mask"] >> k & 1:
+                print(f"  repeater {k}: asked {d(0, o):.0f}/s, answered {d(0, o + 4):.0f}/s, taken {d(0, o + 8):.0f}/s, "
+                      + ("never answered" if ms == 0xFFFFFFFF else f"last answer {ms / 1000:.1f} s ago"))
+        print("  slot  polls/s   loss  main alone  relayed/s  taken/s  -dBm at repeater")
+        for i in range(10):
+            polls, ok = d(3 + i, 0), d(3 + i, 4)
+            if polls < 0.5: continue
+            pg, e = (1, 1 + 9 * i) if i < 6 else (2, 1 + 9 * (i - 4))   # 0x3E page 1: slots 0-5, 4-9
+            loss = 100 * (1 - min(ok, polls) / polls)
+            print(f"  {i:4d}  {polls:7.0f}  {loss:4.1f}%  {min(100, loss + 100 * d(pg, e) / polls):9.1f}%  {d(pg, e):9.0f}  {d(pg, e + 4):7.0f}  {y[pg][e + 8]}")
+    else: sys.exit("repeater status [SECS] | set MAIN [ID] | clear | use on|off [ID]")
+
 def main():
     a = sys.argv[1:] or ["info"]
     c = a[0]
@@ -247,6 +329,7 @@ def main():
     elif c == "flash": flash(a[1])
     elif c == "scan": scan()
     elif c == "bank-update": bank_update(a[1] if len(a) > 1 else BUILD)
+    elif c == "repeater": repeater(a[1:])
     else: print(__doc__)
 
 if __name__ == "__main__":

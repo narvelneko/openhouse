@@ -39,7 +39,8 @@ class TelemetryServer {
 
   void Log(double time, LogLevel level, const std::string& serial, const std::string& text);
   void PublishState(double time, const SessionSnapshot& snapshot, const std::vector<DeviceUpdate>& updates,
-                    const std::vector<Session::Receiver>& receivers, const RoomStatus& room);
+                    const std::vector<Session::Receiver>& receivers, const RoomStatus& room,
+                    const std::vector<DoormanRepeaterStatus>& doormanDongles = {});
   // The driver's settings as the overlay shows them: a JSON object, sent in every state.
   void SetSettings(std::string json);
 

@@ -55,6 +55,9 @@ constexpr auto kHangCap = std::chrono::seconds(3);
 std::set<std::string> hangFeatures;
 int featureHanging = 0;
 constexpr auto kFeatureHangCap = std::chrono::seconds(15);
+// Fake dongle firmware for a test: answers each command as it's written, so the reply is there for the same
+// read pass.
+std::function<void(Handle&, const std::vector<uint8_t>&)> onWrite;
 
 void Reset() {
   std::lock_guard lock(m);
@@ -64,6 +67,7 @@ void Reset() {
   endPass = {};
   hangOpens.clear();
   hangFeatures.clear();
+  onWrite = {};
 }
 void ReleaseFeatures() {
   std::lock_guard lock(m);
@@ -166,8 +170,12 @@ int HID_API_CALL hid_read(hid_device* d, unsigned char* data, size_t n) {
   }
   auto r = h->input.front();
   h->input.pop_front();
-  // A live reply (0x29) answers the last request for its first page: it carries that request's seq.
-  if (r.size() > 1 && r[0] == 0x29)
+  // A queued live reply (0x29) answers the last request for its first page: it carries that request's seq.
+  // (A fake firmware's reply already carries its request's.)
+  const auto asked = [&](uint8_t seq) {
+    return std::any_of(h->written.begin(), h->written.end(), [&](const auto& w) { return w.size() > 3 && w[1] == 0x29 && w[2] == seq; });
+  };
+  if (r.size() > 1 && r[0] == 0x29 && !(fake::onWrite && asked(r[1])))
     for (auto w = h->written.rbegin(); w != h->written.rend(); ++w)
       if (w->size() > 3 && (*w)[1] == 0x29 && (*w)[3] == 0) { r[1] = (*w)[2]; break; }
   const size_t count = std::min(n, r.size());
@@ -179,6 +187,7 @@ int HID_API_CALL hid_write(hid_device* d, const unsigned char* data, size_t n) {
   auto* h = reinterpret_cast<fake::Handle*>(d);
   if (h->gone) return -1;
   h->written.emplace_back(data, data + n);
+  if (fake::onWrite) fake::onWrite(*h, h->written.back());
   return int(n);
 }
 }
@@ -1293,4 +1302,107 @@ TEST_F(Doorman, AWatchmanDeviceSendingImuButNoLightIsAskedForItsProtocolAgain) {
   const size_t before = VersionRequests("W0");
   for (double t = now; t < now + 30; t += 0.5) Access::Wake(*transport, t);
   EXPECT_EQ(VersionRequests("W0"), before);
+}
+
+// Fake firmware with repeaters: answers 0x23, 0x3F, 0x3D and 0x3E with totals that grow at fixed rates per
+// second of the test clock.
+namespace {
+struct RepeaterFirmware {
+  bool upstream = false;        // 0x3F unknown (status 1)
+  int role = 0;                 // 0 main (repeater 0 in use), 1 repeater 0 of kMainBase
+  uint32_t netBase = 0;
+  double* t = nullptr;
+  double t0 = 0;
+  bool slot8 = false;           // a device in slot 8 (0x29 from 6)
+  static constexpr uint32_t kMainBase = 0x21436587;
+  void operator()(fake::Handle& h, const std::vector<uint8_t>& w) const {
+    const uint8_t cmd = w[1];
+    std::vector<uint8_t> r(64);
+    r[0] = cmd; r[1] = w[2];
+    uint8_t* d = r.data() + 3;
+    const double s = *t - t0;
+    auto put = [](uint8_t* p, double v) { const uint32_t u = uint32_t(v); std::memcpy(p, &u, 4); };
+    if (cmd == 0x3F) {
+      if (upstream) { r[2] = 1; h.input.push_back(r); return; }
+      d[0] = d[11] = uint8_t(role); d[1] = 0;
+      put(d + 2, role ? kMainBase : 0); std::memcpy(d + 6, &netBase, 4); d[10] = role ? 0 : 1;
+    } else if (cmd == 0x23 && w[3] == 0) {
+      put(d, 1000 * s); put(d + 4, 900 * s);   // polls, answers (relayed ones too): 10 % loss
+    } else if (cmd == 0x3D) {
+      if (w[3] == 0) { d[0] = uint8_t(role); d[1] = role; d[16] = 60; }
+      else { d[0] = 1; put(d + 1, 100 * s); d[41] = 62; }   // slot 0 heard 100/s at -62
+    } else if (cmd == 0x3E && w[3] == 0) {
+      put(d + 1, 60 * s); put(d + 1 + 4, 55 * s); put(d + 1 + 8, 50 * s); put(d + 1 + 12, 100);   // asked, SREPs, taken, ms
+      put(d + 1 + 16 + 12, 0xFFFFFFFFu);
+      d[33] = 1;
+    } else if (cmd == 0x3E && w[3] == 1 && w[4] == 0) {
+      put(d + 1, 50 * s); put(d + 1 + 4, 40 * s);   // slot 0: relayed, taken
+    } else if (cmd == 0x3E && w[3] == 1 && w[4] == 4) {
+      put(d + 1 + 9 * 4, 30 * s); put(d + 1 + 9 * 4 + 4, 20 * s);   // slot 8 (slots 4-9 from 4)
+    } else if (cmd == 0x29 && slot8) {
+      d[w[3] == 6 ? 2 * 10 : 0] = 3;   // slots 0 and 8 used and active
+    } else if (cmd == 0x01 && slot8) {
+      std::memcpy(d, "OHDG", 4); d[60] = 10;   // 10 slots
+    } else {
+      return;
+    }
+    h.input.push_back(r);
+  }
+};
+}  // namespace
+
+TEST_F(Doorman, UpstreamFirmwareGetsNoRepeaterCommands) {
+  Plug("A", L"TESTA");
+  fake::onWrite = RepeaterFirmware{true, 0, 0, &t, t};
+  for (int i = 0; i < 12; ++i) Step();
+  EXPECT_EQ(Sent("A0", 0x3F), 1u);   // probed once
+  EXPECT_EQ(Sent("A0", 0x3D) + Sent("A0", 0x3E), 0u);
+  EXPECT_TRUE(transport->DoormanRepeaters().empty());
+}
+
+TEST_F(Doorman, MainAndRepeaterStatusAndRates) {
+  Plug("A", L"TESTA");
+  Plug("B", L"TESTB");
+  const RepeaterFirmware main{false, 0, RepeaterFirmware::kMainBase, &t, t, true}, rep{false, 1, 0x0A0B0C0D, &t, t};
+  fake::onWrite = [&](fake::Handle& h, const std::vector<uint8_t>& w) { (h.path[0] == 'A' ? main : rep)(h, w); };
+  Step();
+  Queue("A0", Live(0b1, 0b1));
+  Step();
+  Queue("A0", Ident(0, kA1));
+  Queue("A0", Ident(8, kA2));   // slot 8 streams on interface 0 too
+  const double start = t;
+  for (int i = 0; i < 24; ++i) Step();   // (each relay page every other second: slots 6-9 are paired)
+  EXPECT_LE(Sent("A0", 0x3D) + Sent("A0", 0x3E), size_t(3 * (t - start) + 3));   // ~3 a second
+  EXPECT_EQ(Sent("B0", 0x3E), 0u);
+  const lh::usb::UsbTransport::Receiver *a = nullptr, *a8 = nullptr, *b = nullptr;
+  const auto receivers = transport->Receivers();
+  for (const auto& r : receivers) {
+    if (r.serial == "OHDG-TESTA/0") a = &r;
+    if (r.serial == "OHDG-TESTA/8") a8 = &r;
+    if (r.serial == "OHDG-TESTB/0") b = &r;
+  }
+  ASSERT_TRUE(a && a8 && b);
+  EXPECT_NEAR(a8->viaRepeaterPerSec, 20, 1);   // slots 6-9 come from the relay page from slot 4
+  const auto reps = transport->DoormanRepeaters();
+  ASSERT_EQ(reps.size(), 2u);
+  const auto& ma = reps[0].serial == "OHDG-TESTA" ? reps[0] : reps[1];
+  const auto& rb = reps[0].serial == "OHDG-TESTA" ? reps[1] : reps[0];
+  EXPECT_EQ(ma.role, 0);
+  ASSERT_EQ(ma.repeaters.size(), 1u);
+  EXPECT_TRUE(ma.repeaters[0].answering);
+  EXPECT_NEAR(ma.repeaters[0].lastAnswer, 0.1, 1e-9);
+  EXPECT_NEAR(ma.repeaters[0].asksPerSec, 60, 1);
+  EXPECT_NEAR(ma.repeaters[0].answersPerSec, 55, 1);
+  EXPECT_NEAR(a->lossPercent, 10, 0.2);
+  EXPECT_NEAR(a->lossAlonePercent, 15, 0.2);   // 10 % + 50 relayed answers per 1000 polls
+  EXPECT_NEAR(a->viaRepeaterPerSec, 40, 1);
+  EXPECT_NEAR(a->viaRepeaterPercent, 100.0 * 40 / 900, 0.2);
+  EXPECT_EQ(rb.role, 1);
+  EXPECT_EQ(rb.mainSerial, "OHDG-TESTA");
+  EXPECT_TRUE(rb.following);
+  EXPECT_EQ(rb.mainRssi, -60);
+  EXPECT_NEAR(rb.heardPerSec[0], 100, 1);
+  EXPECT_EQ(rb.heardRssi[0], -62);
+  EXPECT_LT(b->viaRepeaterPerSec, 0);
+  EXPECT_FALSE(transport->SetPairing("OHDG-TESTB/0", 1000));   // a repeater can't be a pairing target
 }

@@ -28,6 +28,7 @@ constexpr double kFeatureTimeout = 0.15;
 
 constexpr uint8_t kCmdChannels = 0x27, kCmdHome = 0x36, kCmdRadios = 0x38, kCmdRejoin = 0x33, kCmdSetName = 0x34, kCmdGetName = 0x35, kCmdPacked = 0x37, kCmdInfo = 0x01;
 constexpr size_t kNameMax = 59;   // what the dongle keeps (link.c DML_NAME_MAX)
+constexpr uint8_t kCmdRole = 0x3F, kCmdRepStatus = 0x3D, kCmdRelay = 0x3E;   // repeaters (ai/doorman/protocol.md)
 constexpr uint8_t kCmdDown = 0x21, kCmdStats = 0x23, kCmdPair = 0x24, kCmdSlots = 0x25, kCmdLive = 0x29, kCmdIdent = 0x2A;
 
 uint32_t Rd32(const uint8_t* p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
@@ -183,7 +184,10 @@ bool DoormanDongle::TakeOpened() {
     std::lock_guard lock(mutex_);
     opened_ = true;
   }
-  for (auto& s : slots_) { s.used = s.active = s.noIdent = false; s.identSeq = -1; s.identTries = 0; }
+  for (auto& s : slots_) {
+    s.used = s.active = s.noIdent = false; s.identSeq = -1; s.identTries = 0;
+    s.relayedPs = s.takenPs = -1;
+  }
   for (int i = 0; i < kSlots; ++i) { frag_[i].clear(); packSeq_[i] = -1; }
   const uint8_t on = 1;
   Send(kCmdPacked, &on, 1);   // full stream reports; a dongle without it ignores the command and sends whole frames
@@ -191,6 +195,9 @@ bool DoormanDongle::TakeOpened() {
   sentHome_ = -1;               // it may still have a home from before (until it's unplugged): told again
   Send(kCmdInfo, nullptr, 0);   // how many slots it has
   nextLive_ = 0;
+  repFw_ = -1; roleTries_ = 0; roleSeq_ = -1; repSeq_ = {-1, -1, -1}; readRole_ = true; nextRep_ = 0;
+  rep_ = {};
+  satTotals_ = slotTotals_[0] = slotTotals_[1] = heardTotals_ = {};
   log_(LogLevel::Info, "Doorman Dongle " + serial_ + " opened");
   return true;
 }
@@ -360,6 +367,7 @@ void DoormanDongle::Pump(double now) {
     }
     RefreshStatsCache();
   }
+  if (repFw_ != 0 && now >= nextRep_) PollRepeater(now);
   if (now >= nextLinkLog_) {           // each connected slot's link over the last 30 s, for logs sent in by users
     const bool first = nextLinkLog_ == 0;
     nextLinkLog_ = now + 30;
@@ -596,10 +604,37 @@ void DoormanDongle::OnReport(double t, const uint8_t* r, int n, bool last) {
       s.dps = (v[7] - s.drops) / dt;
       s.loss = dp ? 100.0 * (1.0 - double(std::min(dok, dp)) / dp) : -1;
     }
+    if (s.haveStats && t > s.statsT) {
+      s.pollsPs = (v[0] - s.polls) / (t - s.statsT);
+      s.okPs = (v[1] - s.respOk) / (t - s.statsT);
+    }
     s.haveStats = true; s.statsT = t;
     std::copy(std::begin(v), std::end(v), s.raw.begin());
     s.polls = v[0]; s.respOk = v[1]; s.framesUp = v[5]; s.bytesUp = v[6]; s.drops = v[7];
     s.rssiD = -std::abs(int32_t(v[10])); s.rssiT = -std::abs(int32_t(v[11]));   // dongle keeps magnitudes
+  } else if (r[0] == kCmdRole && r[1] == roleSeq_) {
+    roleSeq_ = -1;
+    if (r[2] == 1) { repFw_ = 0; return; }   // unknown command: firmware without repeaters
+    if (r[2] != 0 || n < 15) return;
+    repFw_ = 1;
+    readRole_ = false;
+    const int running = d[11];
+    const uint32_t mainBase = Rd32(d + 2);
+    if (running != rep_.role || (running == 1 && (d[1] != rep_.id || mainBase != rep_.mainBase))) {
+      char b[96];
+      if (running == 1) std::snprintf(b, sizeof b, ": repeater %d of the main with network base %08X", d[1], unsigned(mainBase));
+      else std::snprintf(b, sizeof b, ": main, repeaters in use 0x%X", d[10]);
+      log_(LogLevel::Info, "Doorman Dongle " + serial_ + b);
+      rep_ = {};
+      for (auto& s : slots_) s.relayedPs = s.takenPs = -1;
+    }
+    rep_.role = running; rep_.id = d[1]; rep_.mainBase = mainBase; rep_.netBase = Rd32(d + 6); rep_.mask = d[10];
+    nextRep_ = 0;
+  } else if ((r[0] == kCmdRepStatus || r[0] == kCmdRelay) && r[2] == 0 && n >= 63 &&
+             std::find(repSeq_.begin(), repSeq_.end(), r[1]) != repSeq_.end()) {
+    const int kind = int(std::find(repSeq_.begin(), repSeq_.end(), r[1]) - repSeq_.begin());
+    repSeq_[size_t(kind)] = -1;
+    OnRepeaterReply(t, r[0], kind, d);
   } else if (r[0] == kCmdGetName) {
     for (auto& s : slots_) {
       if (s.nameSeq != r[1]) continue;
@@ -651,6 +686,96 @@ void DoormanDongle::OnReport(double t, const uint8_t* r, int n, bool last) {
       }
       break;
     }
+  }
+}
+
+// Sent once a second. Until the role is known: 0x3F, whose answer also shows whether the firmware has
+// repeaters. Then 0x3D page 0, whose role byte shows a role change (the role is then read again), and: on a
+// main, 0x3E page 0 (per repeater) and page 1 (per slot, 6 slots per reply, alternating between slots 0-5 and
+// 4-9 when 6-9 are paired); on a repeater, 0x3D page 1 (the slots it hears).
+// None of these reads resets a counter.
+void DoormanDongle::PollRepeater(double now) {
+  nextRep_ = now + 1.0;
+  if (readRole_) {
+    if (repFw_ < 0 && ++roleTries_ > 5) { repFw_ = 0; return; }   // no answer in 5 tries: stop asking
+    const uint8_t a = 0xFF;   // 0xFF: read only
+    Send(kCmdRole, &a, 1);
+    roleSeq_ = seq_;
+    return;
+  }
+  const uint8_t p0[2] = {0, 0}, p1 = 1;
+  Send(kCmdRepStatus, p0, 1);
+  repSeq_[0] = seq_;
+  if (rep_.role == 1) {
+    Send(kCmdRepStatus, &p1, 1);
+    repSeq_[1] = seq_;
+    return;
+  }
+  Send(kCmdRelay, p0, 2);
+  repSeq_[1] = seq_;
+  if (!rep_.mask) return;
+  bool high = false;
+  for (int i = 6; i < kSlots; ++i) high |= slots_[i].used;
+  relayFirst_ = high && relayFirst_ == 0 ? 4 : 0;
+  const uint8_t a[2] = {1, uint8_t(relayFirst_)};
+  Send(kCmdRelay, a, 2);
+  repSeq_[2] = seq_;
+}
+
+bool DoormanDongle::Rates(Totals& last, double t, const uint32_t* v, int n, double* rates) {
+  bool ok = last.have && last.role == rep_.role && t > last.t;
+  for (int i = 0; ok && i < n; ++i)
+    if (v[i] < last.v[size_t(i)]) { ok = false; readRole_ = true; }   // a total went down: restarted, maybe in a new role
+  for (int i = 0; i < n; ++i) {
+    if (ok) rates[i] = double(v[i] - last.v[size_t(i)]) / (t - last.t);
+    last.v[size_t(i)] = v[i];
+  }
+  last.have = true; last.role = rep_.role; last.t = t;
+  return ok;
+}
+
+void DoormanDongle::OnRepeaterReply(double t, uint8_t cmd, int kind, const uint8_t* d) {
+  if (cmd == kCmdRepStatus && kind == 0) {   // 0x3D page 0
+    if (d[0] != rep_.role) readRole_ = true;   // the role changed: read it again (0x3F)
+    if (rep_.role == 1) {
+      rep_.following = d[1] != 0;
+      rep_.mainRssi = d[16] ? -int(d[16]) : 0;
+    }
+  } else if (cmd == kCmdRepStatus && rep_.role == 1) {   // 0x3D page 1: per slot RESPs heard (from 1), -dBm (from 41)
+    uint32_t v[kSlots];
+    double r[kSlots];
+    for (int i = 0; i < kSlots; ++i) v[i] = Rd32(d + 1 + 4 * i);
+    const bool ok = Rates(heardTotals_, t, v, kSlots, r);
+    for (int i = 0; i < kSlots; ++i) {
+      rep_.heardPerSec[size_t(i)] = ok ? r[i] : 0;
+      rep_.heardRssi[size_t(i)] = d[41 + i] ? -int(d[41 + i]) : 0;
+    }
+  } else if (cmd == kCmdRelay && kind == 1 && rep_.role == 0) {   // 0x3E page 0: per repeater
+    rep_.mask = d[33];
+    uint32_t v[4];
+    double r[4];
+    for (int k = 0; k < 2; ++k) { v[2 * k] = Rd32(d + 1 + 16 * k); v[2 * k + 1] = Rd32(d + 1 + 16 * k + 4); }   // asked, SREPs
+    const bool ok = Rates(satTotals_, t, v, 4, r);
+    rep_.repeaters.clear();
+    for (int k = 0; k < 2; ++k) {
+      if (!(rep_.mask >> k & 1)) continue;
+      DoormanRepeaterStatus::Repeater x;
+      x.id = k;
+      const uint32_t ms = Rd32(d + 1 + 16 * k + 12);
+      x.lastAnswer = ms == 0xFFFFFFFFu ? -1 : ms / 1000.0;
+      x.answering = ms < 5000;
+      if (ok) { x.asksPerSec = r[2 * k]; x.answersPerSec = r[2 * k + 1]; }
+      rep_.repeaters.push_back(x);
+    }
+    if (!rep_.mask)
+      for (auto& s : slots_) s.relayedPs = s.takenPs = -1;
+  } else if (cmd == kCmdRelay && kind == 2 && rep_.role == 0) {   // 0x3E page 1: 6 slots from relayFirst_
+    const int first = relayFirst_;
+    uint32_t v[12];
+    double r[12];
+    for (int k = 0; k < 6; ++k) { v[2 * k] = Rd32(d + 1 + 9 * k); v[2 * k + 1] = Rd32(d + 1 + 9 * k + 4); }   // relayed, taken
+    if (!Rates(slotTotals_[first / 4], t, v, 12, r)) return;
+    for (int k = 0; k < 6; ++k) { slots_[first + k].relayedPs = r[2 * k]; slots_[first + k].takenPs = r[2 * k + 1]; }
   }
 }
 
@@ -1109,6 +1234,11 @@ std::vector<DoormanDongle::SlotStat> DoormanDongle::SlotStats() const {
   return opened_ ? statsCache_ : std::vector<SlotStat>();
 }
 
+DoormanRepeaterStatus DoormanDongle::Repeater() const {
+  std::lock_guard lock(mutex_);
+  return opened_ ? repCache_ : DoormanRepeaterStatus();
+}
+
 void DoormanDongle::RefreshStatsCache() {     // reader thread: slots_ is its own
   std::vector<SlotStat> out;
   int joined = 0;
@@ -1120,6 +1250,11 @@ void DoormanDongle::RefreshStatsCache() {     // reader thread: slots_ is its ow
     if (s.active) {
       st.kBytesPerSec = s.kBps; st.framesPerSec = s.fps; st.lossPercent = s.loss; st.dropsPerSec = s.dps;
       st.rssiDongle = s.rssiD; st.rssiDevice = s.rssiT;
+      if (rep_.role == 0 && rep_.mask && s.takenPs >= 0) {
+        st.viaRepeaterPerSec = s.takenPs;
+        st.viaRepeaterPercent = s.okPs > 0 ? std::min(100.0, 100.0 * s.takenPs / s.okPs) : 0;
+        if (s.loss >= 0 && s.pollsPs > 0) st.lossAlonePercent = std::min(100.0, s.loss + 100.0 * s.relayedPs / s.pollsPs);
+      }
     }
     st.devicesOnDongle = joined;
     st.name = s.name; st.haveName = s.haveName;
@@ -1130,6 +1265,7 @@ void DoormanDongle::RefreshStatsCache() {     // reader thread: slots_ is its ow
   }
   std::lock_guard lock(mutex_);
   statsCache_.swap(out);
+  repCache_ = rep_;
 }
 
 }  // namespace lh::usb

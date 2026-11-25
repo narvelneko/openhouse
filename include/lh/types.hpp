@@ -98,4 +98,30 @@ struct BatteryReport {
   uint8_t raw = 0;
 };
 
+// A Doorman Dongle's repeater role and status (dongle firmware 0x0031+, see ai/doorman/protocol.md), read by
+// the driver each second. Rates are per second since the previous read; there are none right after a dongle
+// restart or role change.
+struct DoormanRepeaterStatus {
+  std::string serial;       // the dongle's serial ("OHDG-...")
+  int role = -1;            // -1: firmware without repeaters (or not read yet), 0 main, 1 repeater
+  uint32_t netBase = 0;     // its own network base
+  // main: the repeater ids it uses now (one bit each), and the status of each
+  int mask = 0;
+  struct Repeater {
+    int id = 0;
+    bool answering = false;   // an answer (SREP) within the last 5 s
+    double lastAnswer = -1;   // s since its last answer, -1 never
+    double asksPerSec = 0, answersPerSec = 0;
+  };
+  std::vector<Repeater> repeaters;
+  // repeater: its id and its main (mainSerial: the main's serial, if it's plugged in here too)
+  int id = 0;
+  uint32_t mainBase = 0;
+  std::string mainSerial;
+  bool following = false;   // in sync with the main (else searching)
+  int mainRssi = 0;         // dBm, 0 unknown
+  std::array<double, 10> heardPerSec{};   // answers (RESPs) per second it hears, per slot of the main (DML_SLOTS)
+  std::array<int, 10> heardRssi{};
+};
+
 }  // namespace lh

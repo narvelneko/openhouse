@@ -1,6 +1,7 @@
 #include "telemetry_server.hpp"
 
 #include <chrono>
+#include <cstdio>
 #include <nlohmann/json.hpp>
 
 #include "lh/telemetry.hpp"
@@ -100,7 +101,8 @@ void TelemetryServer::Log(double time, LogLevel level, const std::string& serial
 }
 
 void TelemetryServer::PublishState(double time, const SessionSnapshot& snapshot, const std::vector<DeviceUpdate>& updates,
-                                   const std::vector<Session::Receiver>& receivers, const RoomStatus& room) {
+                                   const std::vector<Session::Receiver>& receivers, const RoomStatus& room,
+                                   const std::vector<DoormanRepeaterStatus>& doormanDongles) {
   if (!thread_.joinable()) return;
   {
     std::lock_guard lock(mutex_);
@@ -154,14 +156,39 @@ void TelemetryServer::PublishState(double time, const SessionSnapshot& snapshot,
       e["rssi"] = {r.rssiDongle, r.rssiDevice};
       if (r.firmware) { e["firmware"] = r.firmware; e["firmwareOld"] = r.firmwareOld; }
       if (r.radio) { e["radio"] = r.radio; e["radioOld"] = r.radioOld; }
+      if (r.viaRepeaterPerSec >= 0) {   // a main with repeaters in use
+        e["viaRepeater"] = r.viaRepeaterPerSec; e["viaRepeaterShare"] = r.viaRepeaterPercent;
+        if (r.lossAlonePercent >= 0) e["lossAlone"] = r.lossAlonePercent;
+      }
     }
     rx.push_back(std::move(e));
+  }
+  json dongles = json::array();   // Doorman Dongles whose firmware has repeaters
+  for (const auto& p : doormanDongles) {
+    char base[12];
+    std::snprintf(base, sizeof base, "%08X", unsigned(p.netBase));
+    json e = {{"serial", p.serial}, {"role", p.role == 1 ? "repeater" : "main"}, {"netBase", base}};
+    if (p.role == 0) {
+      json reps = json::array();
+      for (const auto& x : p.repeaters)
+        reps.push_back({{"id", x.id}, {"answering", x.answering}, {"lastAnswer", x.lastAnswer},
+                        {"asksPerSec", x.asksPerSec}, {"answersPerSec", x.answersPerSec}});
+      e["repeaterMask"] = p.mask; e["repeaters"] = reps;
+    } else {
+      std::snprintf(base, sizeof base, "%08X", unsigned(p.mainBase));
+      json heard = json::array();
+      for (size_t i = 0; i < p.heardPerSec.size(); ++i)
+        if (p.heardPerSec[i] > 0) heard.push_back({{"slot", i}, {"perSec", p.heardPerSec[i]}, {"rssi", p.heardRssi[i]}});
+      e["repeaterId"] = p.id; e["mainBase"] = base; e["main"] = p.mainSerial; e["following"] = p.following;
+      e["mainRssi"] = p.mainRssi; e["heard"] = heard;
+    }
+    dongles.push_back(std::move(e));
   }
   const std::string line =
       json{{"type", "state"}, {"t", time},
            {"room", {{"id", snapshot.roomId}, {"settled", room.settled}, {"epoch", room.epoch}, {"settleSigma", room.settleSigma},
                      {"resets", room.resets}, {"learned", learned}, {"seen", seenBases}}},
-           {"bases", bases}, {"devices", devices}, {"receivers", rx}}
+           {"bases", bases}, {"devices", devices}, {"receivers", rx}, {"dongles", dongles}}
           .dump(-1, ' ', false, json::error_handler_t::replace);
   std::lock_guard lock(mutex_);
   // The settings object goes in as it was set (the driver built it as JSON).

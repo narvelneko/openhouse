@@ -151,7 +151,20 @@ void TelemetryClient::Handle(const std::string& line) {
       }
       x.firmware = r.value("firmware", 0); x.firmwareOld = r.value("firmwareOld", false);
       x.radio = r.value("radio", uint32_t(0)); x.radioOld = r.value("radioOld", false);
+      x.viaRepeater = r.value("viaRepeater", -1.0); x.viaRepeaterShare = r.value("viaRepeaterShare", -1.0);
+      x.lossAlone = r.value("lossAlone", -1.0);
       s.receivers.push_back(std::move(x));
+    }
+    for (const auto& d : j.value("dongles", json::array())) {
+      Dongle x;
+      x.serial = d.value("serial", ""); x.role = d.value("role", ""); x.netBase = d.value("netBase", "");
+      for (const auto& p : d.value("repeaters", json::array()))
+        x.repeaters.push_back({p.value("id", 0), p.value("answering", false), p.value("lastAnswer", -1.0),
+                               p.value("asksPerSec", 0.0), p.value("answersPerSec", 0.0)});
+      x.repeaterId = d.value("repeaterId", 0); x.main = d.value("main", ""); x.mainBase = d.value("mainBase", "");
+      x.following = d.value("following", false); x.mainRssi = d.value("mainRssi", 0);
+      for (const auto& h : d.value("heard", json::array())) x.heard.push_back({h.value("slot", 0), h.value("perSec", 0.0), h.value("rssi", 0)});
+      if (!x.serial.empty()) s.dongles[x.serial] = std::move(x);
     }
     if (const auto st = j.find("settings"); st != j.end() && st->is_object()) s.settingsJson = st->dump();
     state_ = std::move(s);

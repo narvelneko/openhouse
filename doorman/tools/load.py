@@ -16,6 +16,7 @@
                                DENSITIES (default 1-8), FILLER (radios without the LH2 coder, e.g. Tracker 1.0)
                                sending filler at GEN's average on-air rate, so every device loads the link alike;
                                measures each step for SECS (default 15) and stops once data is dropped
+  load.py timing [0|1|3]       the timing mode (0x2D; 3: timer-started POLLs, the default), cycle and slot
 
 Filler frames are type 'Z': the dongle and the host carry them like data, the driver skips them.
 Runs next to the driver (its commands use seq 128..255).
@@ -130,6 +131,12 @@ def main():
             if len(a) > 3:
                 lo, _, hi = a[3].partition('-'); dens = range(int(lo), int(hi or lo) + 1)
             sweep(d, slots_arg(a[1]), slots_arg(a[2]), dens, float(a[4]) if len(a) > 4 else 15)
+        elif a[0] == 'timing':
+            if cmd(d, 0x3F, b'\xff')[0] == 1: sys.exit('this firmware has no timing modes (upstream: adaptive on/off only)')
+            r = cmd(d, 0x2D, bytes([int(a[1]) if len(a) > 1 else 0xFF]))
+            if r[0]: sys.exit(f'timing mode refused (status {r[0]})')
+            per, slot = struct.unpack_from('<II', r[1])
+            print(f'timing mode {r[1][44]} (requested {r[1][20]}): cycle {per} us ({1e6 / per:.0f}/s), slot {slot} us')
         elif a[0] == 'stats':
             stats(d, float(a[1]) if len(a) > 1 else 5)
         else:

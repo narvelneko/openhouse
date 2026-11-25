@@ -67,7 +67,11 @@ inline ImVec4 CardColor() { return ImVec4(0.11f, 0.122f, 0.157f, 0.92f); }
 
 enum class Icon {
   Download, Refresh, Trash, Chip, Restore, BaseStation, Wireless, Dongle, Tracker, Wire,
-  Overview, Map, Settings, Debug, About, Slots, Channels, Record, Folder, Wrench, Headset
+  Overview, Map, Settings, Debug, About, Slots, Channels, Record, Folder, Wrench, Headset,
+  Repeater,  // a dongle with two radio arcs on each side
+  Plug,      // a USB plug on its cable
+  Charger,   // a wall charger: prongs, body and a USB port
+  Timing     // a stopwatch: ring, crown, one hand
 };
 
 inline void Arc(ImDrawList* dl, ImVec2 c, float r, float a0, float a1, ImU32 col, float th) {
@@ -251,6 +255,40 @@ inline void DrawIcon(ImDrawList* dl, Icon icon, ImVec2 c, float s, ImU32 col) {
     case Icon::Folder: {
       const ImVec2 pts[] = {P(-0.85f, -0.6f), P(-0.25f, -0.6f), P(-0.1f, -0.4f), P(0.85f, -0.4f), P(0.85f, 0.7f), P(-0.85f, 0.7f)};
       dl->AddPolyline(pts, 6, col, ImDrawFlags_Closed, th);
+      break;
+    }
+    case Icon::Repeater: {
+      dl->AddRect(P(-0.22f, -0.15f), P(0.22f, 0.85f), col, th, 0, th);
+      dl->AddRect(P(-0.14f, -0.6f), P(0.14f, -0.15f), col, 0, 0, th);
+      dl->AddCircleFilled(P(0, 0.5f), h * 0.08f, col);
+      for (int i = 1; i <= 2; ++i) {
+        const float r = h * (0.22f + 0.3f * float(i));
+        Arc(dl, P(0, 0.3f), r, -pi * 0.2f, pi * 0.2f, col, th);
+        Arc(dl, P(0, 0.3f), r, pi * 0.8f, pi * 1.2f, col, th);
+      }
+      break;
+    }
+    case Icon::Plug:
+      dl->AddRect(P(-0.28f, -0.9f), P(0.28f, -0.42f), col, 0, 0, th);
+      dl->AddRectFilled(P(-0.42f, -0.42f), P(0.42f, 0.28f), col, th);
+      dl->AddLine(P(0, 0.28f), P(0, 0.92f), col, th * 1.3f);
+      break;
+    case Icon::Charger:
+      dl->AddLine(P(-0.3f, -0.92f), P(-0.3f, -0.6f), col, th * 1.3f);
+      dl->AddLine(P(0.3f, -0.92f), P(0.3f, -0.6f), col, th * 1.3f);
+      dl->AddRect(P(-0.62f, -0.6f), P(0.62f, 0.88f), col, th * 1.5f, 0, th);
+      dl->AddRectFilled(P(-0.26f, 0.42f), P(0.26f, 0.62f), col);
+      dl->PathLineTo(P(0.08f, -0.42f)); dl->PathLineTo(P(-0.16f, -0.02f)); dl->PathLineTo(P(0.12f, -0.02f)); dl->PathLineTo(P(-0.1f, 0.3f));
+      dl->PathStroke(col, 0, th);
+      break;
+    case Icon::Timing: {
+      const ImVec2 o = P(0, 0.12f);
+      dl->AddCircle(o, h * 0.72f, col, 32, th);
+      dl->AddLine(P(0, -0.6f), P(0, -0.85f), col, th * 1.3f);         // stem
+      dl->AddLine(P(-0.22f, -0.9f), P(0.22f, -0.9f), col, th * 1.3f);  // crown
+      dl->AddLine(P(0.52f, -0.5f), P(0.66f, -0.64f), col, th);         // side button
+      dl->AddLine(o, P(0.3f, -0.22f), col, th);                        // the hand
+      dl->AddCircleFilled(o, th * 0.9f, col, 12);
       break;
     }
   }

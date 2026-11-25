@@ -52,8 +52,12 @@ void PairingMailbox::Reply(const std::string& address, const std::string& text) 
 std::string PairingMailbox::Discover(Session& session, const std::string& expected, const std::string* messageId) const {
   json j = {{"type", "discover_dongles_response"}, {"isPairing", pairing_.has_value()}, {"dongles", json::array()},
             {"expectedControllerType", expected}};
+  std::vector<std::string> repeaters;   // a repeater dongle has no devices of its own: not a pairing target
+  for (const auto& d : session.DoormanDongles())
+    if (d.role == 1) repeaters.push_back(d.serial + "/");
   for (const auto& r : session.Receivers())
-    j["dongles"].push_back({{"serial", r.serial}, {"firmwareVersion", ""}, {"connectedSerial", r.connected}});
+    if (std::none_of(repeaters.begin(), repeaters.end(), [&](const std::string& p) { return r.serial.rfind(p, 0) == 0; }))
+      j["dongles"].push_back({{"serial", r.serial}, {"firmwareVersion", ""}, {"connectedSerial", r.connected}});
   if (messageId) j["message_id"] = json::parse(*messageId);
   return j.dump(-1, ' ', false, json::error_handler_t::replace);  // a receiver serial may not be UTF-8
 }

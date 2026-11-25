@@ -612,7 +612,17 @@ TEST(Telemetry, ServesHelloBacklogStateAndLogsOnLoopback) {
   base.sigma = 0.017;
   snapshot.bases.push_back(base);
   snapshot.roomId = "steamvr-1";
-  server.PublishState(2.0, snapshot, {}, {}, {false, 3, 0.005});
+  // Doorman slots: a main with repeater 0 in use, and a repeater of it plugged in here too.
+  std::vector<lh::Session::Receiver> receivers(2);
+  receivers[0].serial = "OHDG-A/0"; receivers[0].slot = 0; receivers[0].lossPercent = 10;
+  receivers[0].viaRepeaterPerSec = 40; receivers[0].viaRepeaterPercent = 4.4; receivers[0].lossAlonePercent = 15;
+  receivers[1].serial = "OHDG-B/0"; receivers[1].slot = 0;
+  std::vector<lh::DoormanRepeaterStatus> dongles(2);
+  dongles[0].serial = "OHDG-A"; dongles[0].role = 0; dongles[0].mask = 1; dongles[0].netBase = 0x21436587;
+  dongles[0].repeaters = {{0, true, 0.1, 60, 55}};
+  dongles[1].serial = "OHDG-B"; dongles[1].role = 1; dongles[1].mainBase = 0x21436587; dongles[1].mainSerial = "OHDG-A";
+  dongles[1].following = true; dongles[1].heardPerSec[2] = 100; dongles[1].heardRssi[2] = -62;
+  server.PublishState(2.0, snapshot, {}, receivers, {false, 3, 0.005}, dongles);
   server.Log(2.1, lh::LogLevel::Debug, "", "[multi] chatter");
   auto next = readLines(2);
   ASSERT_GE(next.size(), 2u);
@@ -621,6 +631,19 @@ TEST(Telemetry, ServesHelloBacklogStateAndLogsOnLoopback) {
   EXPECT_FALSE(next[0]["room"]["settled"].get<bool>());
   EXPECT_NEAR(next[0]["bases"][0]["sigma"].get<double>(), 0.017, 1e-9);
   EXPECT_EQ(next[0]["bases"][0]["channel"], "3");
+  const auto& rx = next[0]["receivers"];
+  EXPECT_EQ(rx[0]["lossAlone"], 15);
+  EXPECT_EQ(rx[0]["viaRepeater"], 40);
+  EXPECT_FALSE(rx[1].contains("viaRepeater"));
+  const auto& dj = next[0]["dongles"];
+  ASSERT_EQ(dj.size(), 2u);
+  EXPECT_EQ(dj[0]["serial"], "OHDG-A");
+  EXPECT_EQ(dj[0]["role"], "main");
+  EXPECT_EQ(dj[0]["netBase"], "21436587");
+  EXPECT_EQ(dj[0]["repeaters"][0]["answersPerSec"], 55);
+  EXPECT_EQ(dj[1]["role"], "repeater");
+  EXPECT_EQ(dj[1]["main"], "OHDG-A");
+  EXPECT_EQ(dj[1]["heard"], nlohmann::json::parse(R"([{"slot":2,"perSec":100.0,"rssi":-62}])"));
   EXPECT_EQ(next[1]["level"], "DEBUG");
   lh::net::Close(s);
   server.Stop();

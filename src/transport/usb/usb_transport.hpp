@@ -119,8 +119,11 @@ class UsbTransport {
     std::string name; bool keepsName = false;   // openhouse: the name on the dongle, and whether it keeps one
     int firmware = 0; uint32_t radio = 0;        // openhouse: dongle and device radio firmware (0 unknown)
     bool firmwareOld = false, radioOld = false;  // older than this driver's
+    double viaRepeaterPerSec = -1, viaRepeaterPercent = -1, lossAlonePercent = -1;   // openhouse: DoormanDongle::SlotStat
   };
   std::vector<Receiver> Receivers() const;
+  // Every Doorman Dongle whose firmware has repeaters (mainSerial set when its main is plugged in here too).
+  std::vector<DoormanRepeaterStatus> DoormanRepeaters() const;
   // The name a Doorman Dongle keeps for one of its slots ("OHDG-.../3"); false if there's no such slot.
   bool SetReceiverName(const std::string& receiver, const std::string& name);
   // The device a receiver was carrying has gone (wireless dropout, powered off). Until this
