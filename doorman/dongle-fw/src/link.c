@@ -76,6 +76,19 @@ static pair_store_t pairs;
    (pairs.r.sat_mask) only when the host asks, or once no device is connected: erasing the page stops the CPU
    for ~85 ms, long enough for connected devices to lose the dongle's hopping. */
 static GRP_M uint8_t sat_on;
+/* Repeaters that asked for a place on their own (SREQ, not saved to flash): their net base and when they last
+   asked or answered. Dropped after SAT_AUTO_DROP_MS without either. */
+#define SAT_AUTO_DROP_MS 12000u
+static GRP_M uint8_t sat_auto, sat_annc;
+/* How strongly the main hears each repeater (its SREPs and SREQs), -dBm x16. Weaker than SAT_WEAK_DBM costs
+   relays (the driver tells the user to bring them closer; the repeater flashes its LED). */
+#define SAT_WEAK_DBM 80u
+static GRP_M uint16_t sat_rssi16[2];
+static GRP_M uint8_t sat_info[2][DML_SREQ_LEN_X - DML_SREQ_LEN];   /* each auto repeater's status (SREQ from byte 9) */
+static void sat_rssi_add(int k, uint8_t v) { sat_rssi16[k] = sat_rssi16[k] ? (uint16_t)(sat_rssi16[k] - sat_rssi16[k] / 8 + v * 2) : (uint16_t)(v * 16); }
+typedef struct { uint32_t asks, sreps, acc, last_ms; uint16_t quiet; } satst_t;
+static GRP_M satst_t sats[DML_SAT_MAX];
+static GRP_M uint32_t sat_rbase[2], sat_seen_ms[2];
 
 static void nvmc_wait(void) { while (!NRF_NVMC->READY) {} }
 /* the 8-slot page; repeater firmware 0x0028 kept its settings right after it */
@@ -102,7 +115,7 @@ static void pairs_load(void)
     r->rmagic = ROLE_MAGIC; r->role = 0; r->sat_id = 0; r->sat_mask = 0; r->rsv = 0; r->main_base = 0;
   }
   r->sat_mask &= (1u << DML_SAT_MAX) - 1;
-  if (r->role && !r->main_base) r->role = 0;
+  /* a repeater without a main (main_base 0) picks one itself */
   if (convert) pairs_save();
 }
 static void pairs_save(void)
@@ -798,6 +811,19 @@ static uint32_t t_c;                                       /* current cycle star
 /* The slots polled this cycle: paired and connected. A paired device that's off costs no airtime;
    when it comes back it rejoins through the join beacons (its slot_reset puts it back in). */
 static uint32_t plan;
+static GRP_M uint16_t ru_worst_pm;   /* the worst device loss as the main alone, per mille (~2 s, ru_tick) */
+static uint8_t sat_on_b, ru_on_b;    /* for the beacon: repeaters in use, relaying now */
+/* Every dongle is a normal one (a main) until it hears a main with devices connected while it has none of its
+   own: then it's a repeater on its own (auto_rep, RAM only: it starts as a dongle again after a reset).
+   Back to a dongle after AUTO_ALONE_MS without hearing such a main, when pairing starts, or when one of its own
+   devices answers the short JOIN beacon it keeps sending (every AUTO_OWN_JOIN_MS). Two dongles without devices
+   both stay dongles: a main without devices doesn't count. A repeater set by hand (0x3F) stays one. */
+#define AUTO_ALONE_MS     15000u
+#define AUTO_LISTEN_EVERY 1000u      /* a main without devices listens for others this often... */
+#define AUTO_LISTEN_US    22000u     /* ...this long: beacons are 20 ms apart */
+#define AUTO_OWN_JOIN_MS  100u
+static GRP_M uint8_t auto_rep;
+static GRP_M uint32_t auto_listen_ms, auto_busy_ms, auto_own_ms;
 static void join_beacon(void)
 {
   uint8_t *p = pkt_tx + 1;
@@ -821,9 +847,31 @@ static void join_beacon(void)
     if (since > 0xFFFF) since = 0xFFFF;
   }
   p[19] = (uint8_t)since; p[20] = (uint8_t)(since >> 8);
-  pkt_tx[0] = DML_JOIN_LEN;
+  p[21] = (uint8_t)(ru_worst_pm >= 1000 ? 100 : ru_worst_pm / 10);
+  p[22] = (uint8_t)((sat_on_b & 3) | (ru_on_b ? 0x80 : 0) | (plan ? 0x40 : 0));   /* 0x40: devices connected */
+  p[23] = 0; memset(p + 24, 0, 4);
+  for (int t = 0; t < 2; t++) {                             /* the auto repeaters in turn */
+    sat_annc ^= 1;
+    if ((sat_auto >> sat_annc) & 1) { p[23] = (uint8_t)(0x80 | sat_annc); memcpy(p + 24, &sat_rbase[sat_annc], 4); break; }
+  }
+  pkt_tx[0] = DML_JOIN_LEN_X;
   int n = txrx(DML_JOIN_CHANNEL, DML_JOIN_BASE, DML_JOIN_PREFIX, 400);
   const uint8_t *r = pkt_rx + 1;
+  if (n >= DML_SREQ_LEN && r[0] == DML_SREQ) {               /* a repeater asking for (or keeping) a place */
+    uint32_t rb, mb; memcpy(&rb, r + 1, 4); memcpy(&mb, r + 5, 4);
+    if (mb != net_base) return;
+    int id = -1;
+    for (int k = 0; k < 2; k++) if ((sat_auto >> k) & 1 && sat_rbase[k] == rb) id = k;
+    if (id < 0) for (int k = 0; k < 2 && id < 0; k++) if (!((sat_on >> k) & 1)) id = k;
+    if (id < 0) return;                                     /* full: it looks elsewhere */
+    if (!((sat_auto >> id) & 1)) {
+      memset(&sats[id], 0, sizeof sats[id]); memset(sat_info[id], 0, sizeof sat_info[id]);
+      sat_rbase[id] = rb; sat_auto |= (uint8_t)(1u << id); sat_on |= (uint8_t)(1u << id); sat_rssi16[id] = 0;
+    }
+    sat_seen_ms[id] = ms_ticks; sat_rssi_add(id, (uint8_t)NRF_RADIO->RSSISAMPLE);
+    if (n >= DML_SREQ_LEN_X) memcpy(sat_info[id], r + DML_SREQ_LEN, sizeof sat_info[id]);
+    return;
+  }
   if (n < DML_JREQ_LEN || r[0] != DML_JREQ) return;
   joins_heard++;
   const uint8_t *id = r + 1;
@@ -1004,8 +1052,6 @@ static GRP_M uint32_t sat_next_t;            /* the next start, as the last NEED
 static GRP_M uint8_t sat_next_ok;            /* sat_next_t is set */
 /* Per repeater: NEEDs that asked for something, SREPs received, answers taken from them, ms_ticks of its
    last SREP, NEEDs unanswered in a row. */
-typedef struct { uint32_t asks, sreps, acc, last_ms; uint16_t quiet; } satst_t;
-static GRP_M satst_t sats[DML_SAT_MAX];
 /* Per slot: answers relayed with the expected seq, answers taken, and its -dBm at the repeater. */
 static GRP_M struct { uint32_t relayed, acc; uint8_t rssi; } rly[DML_SLOTS];
 /* Relaying only while it's needed. A repeater in use costs every device on the main ~0.9 ms a cycle (the reserve
@@ -1047,7 +1093,13 @@ static void ru_tick(void)
     if (ru_slow[i] > slow) slow = ru_slow[i];
     lost_all += alone; taken_all += taken;
   }
+  ru_worst_pm = (uint16_t)fast;
   if (ru_backoff_s) ru_backoff_s--;
+  for (int k = 0; k < 2; k++) {                             /* auto repeaters gone quiet */
+    if (!((sat_auto >> k) & 1)) continue;
+    const uint32_t last = sats[k].last_ms && (int32_t)(sats[k].last_ms - sat_seen_ms[k]) > 0 ? sats[k].last_ms : sat_seen_ms[k];
+    if (ms_ticks - last > SAT_AUTO_DROP_MS) { sat_auto &= (uint8_t)~(1u << k); sat_on &= (uint8_t)~(1u << k); }
+  }
   if (!sat_on) { ru_on = 0; return; }
   if (!ru_on) {
     if (fast >= RU_ON_PCT * 10u && !ru_backoff_s) { ru_on = 1; ru_win_s = 0; ru_win_lost = ru_win_taken = 0; }
@@ -1062,7 +1114,7 @@ static void ru_tick(void)
 }
 
 /* Writes the repeater ids in use (sat_on) to flash, if they changed. */
-static void sat_save(void) { if (pairs.r.sat_mask != sat_on) { pairs.r.sat_mask = sat_on; pairs_save(); } }
+static void sat_save(void) { const uint8_t m = (uint8_t)(sat_on & ~sat_auto); if (pairs.r.sat_mask != m) { pairs.r.sat_mask = m; pairs_save(); } }
 
 /* The repeater reserve: time added to every cycle while repeaters are in use, whether anything was missed or
    not. It must stay steady, because a device that misses a POLL keeps hopping on the last period it heard.
@@ -1131,7 +1183,7 @@ static uint16_t need_one(uint8_t sid, uint16_t want, uint16_t listen, uint32_t t
   if (!want) return 0;
   const uint8_t *r = hx_buf + 1;
   if (n < DML_SREP_HDR || r[0] != DML_SREP || r[1] != sid || r[2] != cycle) { if (st->quiet < 0xFFFF) st->quiet++; return 0; }
-  st->quiet = 0; st->sreps++; st->last_ms = ms_ticks;
+  st->quiet = 0; st->sreps++; st->last_ms = ms_ticks; sat_rssi_add(sid, (uint8_t)NRF_RADIO->RSSISAMPLE);
   const uint16_t heard = (uint16_t)(r[3] | r[4] << 8);
   int q = DML_SREP_HDR;
   for (uint8_t i = 0; i < DML_SLOTS; i++) if ((heard >> i) & 1) { rly[i].rssi = q < n ? r[q] : 0; q++; }
@@ -1210,6 +1262,15 @@ static GRP_R uint8_t sr_cur;           /* the receive buffer in use */
 typedef struct { uint8_t valid, rssi, cyc; uint32_t ms; uint8_t b[2 + DML_MAXLEN]; } kept_t;
 static kept_t kept[DML_SLOTS][2];
 static GRP_R uint32_t sv_endc;               /* END count at the last interrupt (+2: one was missed) */
+/* The main followed and our id on it: set by hand (0x3F), or, for a repeater without a set main (sv_auto), the
+   main it chose and the place that main gave it (SREQ, then named in its JOIN). */
+static GRP_R volatile uint32_t sv_mbase;
+static GRP_R volatile uint8_t sv_id, sv_auto;
+static GRP_R volatile uint32_t sv_want;                  /* auto: the main it asks */
+static GRP_R volatile uint8_t sv_confirm;
+static GRP_R volatile uint8_t sv_keep;                   /* auto: renew the place (an SREQ) from the next JOIN */                /* auto: asked, not yet named in a JOIN */
+static GRP_R volatile uint32_t sv_txt, sv_need_ms;   /* when the armed SREP or SREQ starts */
+static GRP_R volatile uint32_t sv_ask_ms, sv_asked_first_ms, sv_kept_ms, sv_since_ms, sv_full_base, sv_full_ms;
 static GRP_R volatile uint8_t sv_search;  /* 1: looking for the main's JOIN beacon (ch 80); sv_begin starts with it */
 static GRP_R uint8_t sv_cyc, sv_ch;          /* the main's cycle, its channel */
 static GRP_R uint16_t sv_listen;              /* the slots the main asked us to listen to (NEED listen) */
@@ -1228,6 +1289,24 @@ static GRP_R uint16_t sv_rssi16[DML_SLOTS], sv_mrssi16;    /* -dBm x16, smoothed
 
 static void sv_rssi(uint16_t *a, uint8_t v) { *a = *a ? (uint16_t)(*a - *a / 16 + v) : (uint16_t)(v * 16); }
 /* With the radio disabled: listen on this cycle's channel, or for the JOIN beacon while searching. */
+/* Mains heard on the join channel while searching (cmd 0x3D page 2): to choose one. */
+#define SV_MAINS 8
+static GRP_R struct { uint32_t base, ms; uint16_t rssi16; uint8_t loss, reps, beacons; } sv_mains[SV_MAINS];
+static void sv_main_heard(const uint8_t *p, int n, uint8_t rssi)
+{
+  uint32_t nb; memcpy(&nb, p + 1, 4);
+  int e = -1, old = 0;
+  for (int i = 0; i < SV_MAINS; i++) {
+    if (sv_mains[i].base == nb) { e = i; break; }
+    if (ms_ticks - sv_mains[i].ms > ms_ticks - sv_mains[old].ms) old = i;
+  }
+  if (e < 0) { e = old; sv_mains[e].base = nb; sv_mains[e].rssi16 = 0; sv_mains[e].beacons = 0; }
+  sv_mains[e].ms = ms_ticks; sv_rssi(&sv_mains[e].rssi16, rssi);
+  if (sv_mains[e].beacons < 255) sv_mains[e].beacons++;
+  sv_mains[e].loss = n >= DML_JOIN_LEN + 2 ? p[21] : 0xFF;   /* 0xFF: older main, doesn't say */
+  sv_mains[e].reps = n >= DML_JOIN_LEN + 2 ? p[22] : 0xFF;
+  if (n >= DML_JOIN_LEN + 2 && (p[22] & 0x40)) auto_busy_ms = ms_ticks;   /* a main with devices: not alone */
+}
 static void sv_rx_start(void)
 {
   NRF_RADIO->SHORTS = 0;
@@ -1237,9 +1316,9 @@ static void sv_rx_start(void)
     /* Logical address 0 is our own, for NEEDs. 1-7 are device slots on the main's network: the planned ones
        first, then the rest (devices that may join). The radio has 8, so with 8 devices one slot isn't heard. */
     ch = dml_channel(sv_cyc, sv_cmask);
-    base = DML_SAT_BASE(pairs.r.main_base); NRF_RADIO->BASE1 = pairs.r.main_base;
+    base = DML_SAT_BASE(sv_mbase); NRF_RADIO->BASE1 = sv_mbase;
     uint8_t *pf = (uint8_t *)pw;
-    pf[0] = (uint8_t)(DML_SAT_PREFIX + pairs.r.sat_id);
+    pf[0] = (uint8_t)(DML_SAT_PREFIX + sv_id);
     int k = 1;
     uint16_t m = sv_listen;
     for (int pass = 0; pass < 2; pass++, m = (uint16_t)~m)
@@ -1305,7 +1384,7 @@ static const kept_t *kept_of(int i, uint8_t cyc)
    from it. Returns 1 if the SREP is armed, 0 to retune for the next cycle. */
 static int sv_need(const uint8_t *p, int n, uint8_t rssi, uint32_t ta)
 {
-  sv_needs++; sv_heard_ms = ms_ticks; sv_rssi(&sv_mrssi16, rssi);
+  sv_needs++; sv_heard_ms = ms_ticks; sv_need_ms = ms_ticks; sv_rssi(&sv_mrssi16, rssi);
   const uint16_t want = (uint16_t)(p[10] | p[11] << 8);
   const uint8_t cap = p[12] > DML_MAXLEN ? DML_MAXLEN : p[12];   /* no more than sr_tx holds */
   int armed = 0;
@@ -1318,7 +1397,7 @@ static int sv_need(const uint8_t *p, int n, uint8_t rssi, uint32_t ta)
       const kept_t *e = kept_of(i, cyc);
       if (e) { heard |= (uint16_t)(1u << i); q[len++] = e->rssi; }
     }
-    q[0] = DML_SREP; q[1] = pairs.r.sat_id; q[2] = sv_cyc; q[3] = (uint8_t)heard; q[4] = (uint8_t)(heard >> 8);   /* the main checks the cycle */
+    q[0] = DML_SREP; q[1] = sv_id; q[2] = sv_cyc; q[3] = (uint8_t)heard; q[4] = (uint8_t)(heard >> 8);   /* the main checks the cycle */
     for (int i = 0; i < DML_SLOTS; i++) {
       if (!((want >> i) & 1)) continue;
       if (k >= n) break;
@@ -1343,7 +1422,7 @@ static int sv_need(const uint8_t *p, int n, uint8_t rssi, uint32_t ta)
       NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk;
       fem_off();                                            /* PPI_LAUNCH's fork sets the amplifier to TX (Holyiot) */
       NRF_TIMER3->EVENTS_COMPARE[CC_LAUNCH] = 0;
-      NRF_TIMER3->CC[CC_LAUNCH] = t_tx;
+      NRF_TIMER3->CC[CC_LAUNCH] = t_tx; sv_txt = t_tx;
       NRF_PPI->CHENSET = 1u << PPI_LAUNCH;
       if ((int32_t)(t_tx - us_now()) > 0) { sp_phase = SP_TXWAIT; sv_sreps++; armed = 1; }
       else { NRF_PPI->CHENCLR = 1u << PPI_LAUNCH; sp_phase = SP_RETUNE; }   /* start passed while arming: no SREP */
@@ -1358,6 +1437,61 @@ static int sv_need(const uint8_t *p, int n, uint8_t rssi, uint32_t ta)
   sv_listen = (uint16_t)(p[8] | p[9] << 8);
   sv_cycles++; sv_coast_run = 0;
   return armed;
+}
+/* Sends sr_tx at t_tx on the current address 0 (the receiver stops first). Returns 1 if armed. */
+static int sv_tx_at(uint32_t t_tx)
+{
+  if ((int32_t)(t_tx - us_now()) <= HX_ARM_MIN_US) return 0;
+  sv_txt = t_tx;
+  NRF_RADIO->SHORTS = 0;
+  NRF_RADIO->TASKS_DISABLE = 1;
+  NRF_RADIO->PACKETPTR = (uint32_t)sr_tx; NRF_RADIO->TXADDRESS = 0;
+  NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk;
+  fem_off();
+  NRF_TIMER3->EVENTS_COMPARE[CC_LAUNCH] = 0;
+  NRF_TIMER3->CC[CC_LAUNCH] = t_tx;
+  NRF_PPI->CHENSET = 1u << PPI_LAUNCH;
+  if ((int32_t)(t_tx - us_now()) > 0) { sp_phase = SP_TXWAIT; return 1; }
+  NRF_PPI->CHENCLR = 1u << PPI_LAUNCH; sp_phase = SP_RETUNE; return 0;
+}
+/* A JOIN from main nb, ending 4*(3+n) us after ta: an auto repeater asks it for a place, or keeps it. Returns 1
+   if the SREQ is armed, 0 if it's named (follow it now), -1 to keep listening. */
+static int sv_auto_join(const uint8_t *p, int n, uint32_t nb, uint32_t ta)
+{
+  if (!sv_want || nb != sv_want) return -1;
+  if (sv_keep && !sv_confirm) {                             /* renewing: send, whatever the JOIN says */
+    sv_keep = 0; sv_ask_ms = ms_ticks - 4000;
+  } else if (n >= DML_JOIN_LEN_X && (p[23] & 0x80) && !memcmp(p + 24, &net_base, 4)) {   /* named: our place */
+    if (sv_mbase != nb) sv_since_ms = ms_ticks;
+    sv_id = p[23] & 1; sv_mbase = nb; sv_confirm = 0;
+    return 0;
+  }
+  if (!sv_confirm && sv_mbase == nb && ms_ticks - sv_ask_ms < 4000) return -1;   /* the JOIN names the other one: wait for ours */
+  if (ms_ticks - sv_ask_ms < 60) return -1;               /* a few beacons for the answer */
+  if (!sv_confirm) { sv_confirm = 1; sv_asked_first_ms = ms_ticks; }
+  sv_ask_ms = ms_ticks;
+  uint8_t *q = sr_tx + 1;
+  q[0] = DML_SREQ; memcpy(q + 1, &net_base, 4); memcpy(q + 5, &nb, 4);
+  const uint32_t id[2] = { NRF_FICR->DEVICEID[1], NRF_FICR->DEVICEID[0] };
+  memcpy(q + 9, id, 8); q[17] = BOARD_ID; q[18] = (uint8_t)DONGLE_FW_VERSION; q[19] = (uint8_t)(DONGLE_FW_VERSION >> 8);
+  q[20] = (uint8_t)(sv_mrssi16 / 16); q[21] = (uint8_t)link_led();
+  sr_tx[0] = DML_SREQ_LEN_X;
+  return sv_tx_at(ta + 4u * (3u + (uint32_t)n) + DML_SREP_TURN_US);
+}
+/* Auto: the main to ask. The one losing the most (what a repeater is for), then the one with fewer repeaters,
+   then the strongest; not one that was full in the last 30 s, nor an older main (it can't take one itself). */
+static uint32_t sv_choose(uint32_t skip)
+{
+  int best = -1; int32_t bs = 0;
+  for (int i = 0; i < SV_MAINS; i++) {
+    if (!sv_mains[i].base || ms_ticks - sv_mains[i].ms > 3000 || sv_mains[i].base == skip || sv_mains[i].reps == 0xFF) continue;
+    if (auto_rep && !(sv_mains[i].reps & 0x40)) continue;   /* on its own: only mains with devices */
+    if (sv_mains[i].base == sv_full_base && ms_ticks - sv_full_ms < 30000) continue;
+    const int loss = sv_mains[i].loss > 100 ? 0 : sv_mains[i].loss;
+    const int32_t sc = loss * 1000 - popc(sv_mains[i].reps & 3) * 300 - sv_mains[i].rssi16 / 16;
+    if (best < 0 || sc > bs) { best = i; bs = sc; }
+  }
+  return best < 0 ? 0 : sv_mains[best].base;
 }
 void RADIO_IRQHandler(void)                                 /* repeaters only: a main never sets INTEN */
 {
@@ -1382,7 +1516,10 @@ void RADIO_IRQHandler(void)                                 /* repeaters only: a
       if (late || !crc) {}                                  /* drop it */
       else if (sv_search) {
         uint32_t nb; memcpy(&nb, p + 1, 4);
-        if (n >= DML_JOIN_LEN && p[0] == DML_JOIN && nb == pairs.r.main_base) {
+        int aj = -1;
+        if (n >= DML_JOIN_LEN && p[0] == DML_JOIN) { sv_main_heard(p, n, rssi); if (sv_auto) aj = sv_auto_join(p, n, nb, ta); }
+        if (aj == 1) act = 1;
+        else if (n >= DML_JOIN_LEN && p[0] == DML_JOIN && sv_mbase && nb == sv_mbase && (!sv_auto || aj == 0)) {
           sv_cyc = (uint8_t)(p[17] + 1); sv_cmask = sv_nmask = (uint16_t)(p[15] | p[16] << 8);
           if (p[18]) { sv_period = p[18] * 50u + 25u; sv_p50 = p[18]; }
           sv_tcs = ta + SAT_JOIN_US - TX_ADDR_US;           /* next cycle: 700 us after the beacon */
@@ -1391,7 +1528,7 @@ void RADIO_IRQHandler(void)                                 /* repeaters only: a
           act = 0;
         }
       } else if (la == 0) {
-        if (n >= DML_NEED_HDR && p[0] == DML_NEED && p[1] == pairs.r.sat_id) act = sv_need(p, n, rssi, ta);
+        if (n >= DML_NEED_HDR && p[0] == DML_NEED && p[1] == sv_id) act = sv_need(p, n, rssi, ta);
       } else if (p[0] == DML_RESP && n >= DML_RESP_HDR && p[1] < DML_SLOTS) {
         kept_t *e = kept[p[1]]; KEEP_PTR(e);
         if (e[0].valid && e[0].cyc != sv_cyc) e[1] = e[0];  /* (a second RESP in the same cycle replaces the first) */
@@ -1421,6 +1558,9 @@ static void sv_begin(void)   /* (re)start the repeater: look for the main's JOIN
   /* TinyUSB stops the crystal when VBUS drops (a weak charger), and the radio needs it */
   if (!(NRF_CLOCK->HFCLKSTAT & CLOCK_HFCLKSTAT_SRC_Msk)) NRF_CLOCK->TASKS_HFCLKSTART = 1;
   sv_search = 1; sv_started = 1; sv_listen = 0;
+  sv_auto = pairs.r.main_base == 0;
+  if (!sv_auto) { sv_mbase = pairs.r.main_base; sv_id = pairs.r.sat_id; }
+  else { sv_mbase = 0; sv_want = 0; sv_confirm = 0; }
   sv_heard_ms = sv_isr_ms = ms_ticks;
   __disable_irq();
   sv_rx_start();                                            /* clears the three events: no interrupt for an old one */
@@ -1436,9 +1576,29 @@ static void sat_poll(void)
   if (!sv_started || (int32_t)(ms_ticks - sv_isr_ms) > 3000) sv_begin();
   __disable_irq();
   /* an SREP that never finished */
-  if (sp_phase >= SP_TXWAIT && (int32_t)(us_time() - sv_tcs) > 3000) {   /* (SP_TXWAIT or SP_TXON) */
+  if (sp_phase >= SP_TXWAIT && (int32_t)(us_time() - sv_txt) > 3000) {   /* (from its start: sv_tcs is stale while searching) */   /* (SP_TXWAIT or SP_TXON) */
     NRF_PPI->CHENCLR = 1u << PPI_LAUNCH;
     if (NRF_RADIO->STATE == RADIO_STATE_STATE_Disabled) sv_rx_start(); else sv_retune();
+  }
+  if (sv_auto && sp_phase == SP_RX) {
+    if (sv_confirm && ms_ticks - sv_asked_first_ms > 2000) {   /* no place given: full, or it doesn't hear us */
+      sv_full_base = sv_want; sv_full_ms = ms_ticks; sv_want = 0; sv_mbase = 0; sv_confirm = 0;
+    }
+    if (!sv_want && sv_search && ms_ticks - sv_kept_ms > 1000) { sv_want = sv_choose(0); sv_kept_ms = ms_ticks; }
+    if (sv_mbase && !sv_search && ms_ticks - sv_kept_ms > 4000) {   /* keep the place: ask again from the JOIN */
+      sv_keep = 1; sv_kept_ms = ms_ticks; sv_search = 1; sv_retune();
+    }
+    /* Once a minute: move to a main losing much more than ours (what we hear while keeping the place) */
+    if (sv_mbase && !sv_confirm && ms_ticks - sv_since_ms > 60000) {
+      sv_since_ms = ms_ticks;
+      const uint32_t o = sv_choose(sv_mbase);
+      int lo = -1, lc = 0;
+      for (int i = 0; i < SV_MAINS; i++) {
+        if (sv_mains[i].base == o) lo = sv_mains[i].loss > 100 ? 0 : sv_mains[i].loss;
+        if (sv_mains[i].base == sv_mbase) lc = sv_mains[i].loss > 100 ? 0 : sv_mains[i].loss;
+      }
+      if (o && lo >= lc + 10) { sv_mbase = 0; sv_want = o; sv_search = 1; sv_retune(); }
+    }
   }
   if (sp_phase == SP_RX && !sv_search) {
     if (ms_ticks - sv_heard_ms > 1000) { sv_search = 1; sv_retune(); }
@@ -1451,7 +1611,13 @@ static void sat_poll(void)
   }
   __enable_irq();
 }
-int link_led(void) { return role_run ? !sv_search : -1; }    /* for main.c's LED, see link.h */
+int link_led(void)                                          /* for main.c's LED, see link.h */
+{
+  if (!role_run) return -1;
+  if (!sv_mbase || (sv_search && ms_ticks - sv_heard_ms > 1000)) return 0;
+  if (sv_mrssi16 / 16 >= SAT_WEAK_DBM) return 3;
+  return ms_ticks - sv_need_ms < 300 ? 2 : 1;
+}
 
 /* ---------------- main-loop entry points ---------------- */
 void link_init(void)
@@ -1503,13 +1669,67 @@ void link_init(void)
   for (int i = 0; i < DML_SLOTS; i++) { sl[i].last_seq = 7; sl[i].dseq = 0; }
 }
 
+/* A main with no devices: listens on the join channel for a JOIN from another main that has some. */
+static int hear_busy_main(uint32_t us)
+{
+  radio_off();
+  NRF_RADIO->FREQUENCY = DML_JOIN_CHANNEL;
+  NRF_RADIO->BASE0 = DML_JOIN_BASE; NRF_RADIO->PREFIX0 = DML_JOIN_PREFIX; NRF_RADIO->RXADDRESSES = 1;
+  NRF_RADIO->PACKETPTR = (uint32_t)pkt_rx;
+  NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk;
+  NRF_RADIO->EVENTS_END = 0;
+  fem_rx();
+  NRF_RADIO->TASKS_RXEN = 1;
+  const uint32_t t0 = us_now();
+  int found = 0;
+  while (!found && us_now() - t0 < us) {
+    if (NRF_RADIO->EVENTS_END) {
+      NRF_RADIO->EVENTS_END = 0;
+      const uint8_t *p = pkt_rx + 1;
+      uint32_t nb; memcpy(&nb, p + 1, 4);
+      if (NRF_RADIO->CRCSTATUS && pkt_rx[0] >= DML_JOIN_LEN + 2 && p[0] == DML_JOIN && nb != net_base && (p[22] & 0x40)) found = 1;
+      else NRF_RADIO->TASKS_START = 1;
+    }
+    if (idle_hook) idle_hook();
+  }
+  radio_off();
+  return found;
+}
+/* An auto repeater with devices paired: its own JOIN, so a device of its that turns on can find it. Returns 1 if
+   one did (then it's a dongle again). */
+static int own_join(void)
+{
+  NRF_RADIO->INTENCLR = 0xFFFFFFFF;
+  radio_off();
+  join_beacon();
+  radio_off();
+  NVIC_ClearPendingIRQ(RADIO_IRQn);
+  for (int i = 0; i < DML_SLOTS; i++) if ((pairs.used >> i) & 1 && sl[i].active) return 1;
+  __disable_irq();
+  sv_rx_start();
+  NRF_RADIO->INTENSET = RADIO_INTENSET_READY_Msk | RADIO_INTENSET_END_Msk | RADIO_INTENSET_DISABLED_Msk;
+  __enable_irq();
+  return 0;
+}
 void link_poll(void)
 {
   load_tick();
   if (pairs_dirty) { pairs_dirty = 0; pairs_save(); }
   if (!link_on) { radio_off(); sv_started = 0; return; }
   /* role changed (0x3F): restart in it */
-  if (role_run != pairs.r.role) { radio_off(); role_run = pairs.r.role; sv_started = 0; }
+  if (pairs.r.role) auto_rep = 0;
+  if (auto_rep) {
+    if (ms_ticks < pairing_until_ms || ms_ticks - auto_busy_ms > AUTO_ALONE_MS) auto_rep = 0;
+    else if (pairs.used && sp_phase == SP_RX && ms_ticks - auto_own_ms >= AUTO_OWN_JOIN_MS) {
+      auto_own_ms = ms_ticks;
+      if (own_join()) auto_rep = 0;
+    }
+  }
+  const uint8_t want_role = pairs.r.role ? 1 : auto_rep;
+  if (role_run != want_role) {
+    NRF_RADIO->INTENCLR = 0xFFFFFFFF; radio_off(); NVIC_ClearPendingIRQ(RADIO_IRQn);
+    role_run = want_role; sv_started = 0;
+  }
   if (role_run) { sat_poll(); return; }                     /* a repeater never sends a JOIN or POLL */
   tmode = tmode_req; adaptive = tmode & 1;                  /* a mode change (0x2D) applies here */
   const int hw = tmode == 3;
@@ -1528,6 +1748,10 @@ void link_poll(void)
      (72 B gave 12.9 kB/s, too little headroom for resends; queues overflowed). 7-8 devices: 176 B, 9.9 ms
      and ~17.7 kB/s each at 8, over the ~13 kB/s a device sends at its worst (LH1, two bases) */
   plan_n = n;
+  if (!n && !pairs.r.role && ms_ticks >= pairing_until_ms && ms_ticks - auto_listen_ms >= AUTO_LISTEN_EVERY) {
+    auto_listen_ms = ms_ticks;
+    if (hear_busy_main(AUTO_LISTEN_US)) { auto_rep = 1; auto_busy_ms = ms_ticks; return; }   /* a repeater from the next call */
+  }
   if (ms_ticks - sizing_ms >= 2000) { sizing_ms = ms_ticks; sizing_eval(&sizing); }
   max_resp = (uint8_t)sizing_resp(&sizing, n);   /* sizing.h: the size for this many devices, or large answers while saturated */
   /* The cycle goes out as one byte of 50 us (POLL p[6], JOIN p[18]): 12.75 ms at most. Nine or ten devices with
@@ -1543,6 +1767,7 @@ void link_poll(void)
   const uint32_t worst = 450u + 4u * max_resp;
   slot_us = adaptive && ex_budget ? (ex_budget + SLOT_GUARD_US < worst ? ex_budget + SLOT_GUARD_US : worst) : worst;
   ru_tick();
+  sat_on_b = (uint8_t)sat_on; ru_on_b = ru_on;
   const int sat = (sat_on && ru_on) || sat_r;               /* once per cycle: the mask command can run mid-cycle */
   /* The join window (700 us) only in the cycles that send a JOIN beacon (every 20 ms): every cycle kept
      it, and at a 4.5 ms cycle three in four carried 700 us of nothing (15% of the cycle, longer between
@@ -1705,6 +1930,7 @@ int link_stream_pop(uint8_t *rep, int itf)
 }
 
 static void put32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
+static void put16_(uint8_t *p, uint16_t v) { memcpy(p, &v, 2); }
 
 int link_cmd(const uint8_t *in, uint8_t *d, uint8_t *st)    /* 0x20..0x2F, 0x32..0x3F; d = 61 bytes */
 {
@@ -1754,7 +1980,8 @@ int link_cmd(const uint8_t *in, uint8_t *d, uint8_t *st)    /* 0x20..0x2F, 0x32.
       /* in RAM at once; a newly used id starts with clear stats */
       if (in[2] != sat_on) {
         for (int k = 0; k < DML_SAT_MAX; k++) if ((in[2] >> k) & 1 && !((sat_on >> k) & 1)) memset(&sats[k], 0, sizeof sats[k]);
-        sat_on = in[2];
+        sat_auto &= (uint8_t)~in[2];                        /* set by hand now */
+        sat_on = (uint8_t)(in[2] | sat_auto);
       }
       /* setup: save to flash now */
       if (in[3] == 1) sat_save();
@@ -1766,8 +1993,17 @@ int link_cmd(const uint8_t *in, uint8_t *d, uint8_t *st)    /* 0x20..0x2F, 0x32.
       for (int k = 0; k < DML_SLOTS; k++) { put32(d + 1 + 4 * k, sv_heard[k]); d[1 + 4 * DML_SLOTS + k] = (uint8_t)(sv_rssi16[k] / 16); }
       return 1;
     }
+    if (in[2] == 2) {                                       /* mains heard: 8 x 7 B from 1 (base u32, -dBm, loss %, repeaters) */
+      d[0] = 2;
+      for (int k = 0; k < SV_MAINS; k++) {
+        uint8_t *e = d + 1 + 7 * k;
+        if (!sv_mains[k].base || ms_ticks - sv_mains[k].ms > 30000) { memset(e, 0, 7); continue; }
+        put32(e, sv_mains[k].base); e[4] = (uint8_t)(sv_mains[k].rssi16 / 16); e[5] = sv_mains[k].loss; e[6] = sv_mains[k].reps;
+      }
+      return 1;
+    }
     if (in[2]) { *st = 2; return 1; }
-    d[0] = pairs.r.role; d[1] = link_led() > 0; d[2] = pairs.r.sat_id; d[3] = sv_ch;
+    d[0] = pairs.r.role; d[1] = link_led() > 0; d[30] = (uint8_t)link_led(); d[2] = sv_id; d[3] = sv_ch; put32(d + 17, sv_mbase);   /* (the main it follows: auto too) */
     put32(d + 4, sv_cycles); put32(d + 8, sv_needs); put32(d + 12, sv_sreps); d[16] = (uint8_t)(sv_mrssi16 / 16);
     return 1;
   case 0x3E:                                                /* main: relay stats [page][first]; totals */
@@ -1779,12 +2015,22 @@ int link_cmd(const uint8_t *in, uint8_t *d, uint8_t *st)    /* 0x20..0x2F, 0x32.
         put32(e + 12, q->last_ms ? ms_ticks - q->last_ms : 0xFFFFFFFFu);
       }
       d[33] = sat_on; d[34] = (uint8_t)sat_r; d[35] = (uint8_t)(sat_r >> 8);
-      d[36] = ru_on; d[37] = (uint8_t)(ru_backoff_s > 255 ? 255 : ru_backoff_s);   /* relaying now; s before a useless one is tried again */
+      d[36] = ru_on; d[37] = (uint8_t)(ru_backoff_s > 255 ? 255 : ru_backoff_s);
+      d[38] = sat_auto; put32(d + 39, sat_rbase[0]); put32(d + 43, sat_rbase[1]); d[52] = (uint8_t)(sat_rssi16[0] / 16); d[53] = (uint8_t)(sat_rssi16[1] / 16);   /* auto repeaters, their bases; -dBm each repeater is heard at (0: not yet) */
     } else if (in[2] == 1) {                                /* 6 slots from [first 0-4], 9 B each */
       if (in[3] > DML_SLOTS - 6) { *st = 2; return 1; }
       for (int k = 0; k < 6; k++) {
         const int j = in[3] + k; uint8_t *e = d + 1 + 9 * k;
         put32(e, rly[j].relayed); put32(e + 4, rly[j].acc); e[8] = rly[j].rssi;
+      }
+    } else if (in[2] == 2) {                                /* repeaters that came on their own: 2 x 20 B from 1 */
+      for (int k = 0; k < 2; k++) {
+        uint8_t *e = d + 1 + 20 * k;
+        memset(e, 0, 20);
+        if (!((sat_auto >> k) & 1)) continue;
+        put32(e, sat_rbase[k]); memcpy(e + 4, sat_info[k], sizeof sat_info[k]);   /* base, then SREQ bytes 9-21 */
+        e[17] = (uint8_t)(sat_rssi16[k] / 16);              /* -dBm the main hears it at */
+        put16_(e + 18, (uint16_t)((ms_ticks - sat_seen_ms[k]) / 100u > 0xFFFF ? 0xFFFF : (ms_ticks - sat_seen_ms[k]) / 100u));   /* 0.1 s since it asked */
       }
     } else *st = 2;
     return 1;
@@ -1794,10 +2040,10 @@ int link_cmd(const uint8_t *in, uint8_t *d, uint8_t *st)    /* 0x20..0x2F, 0x32.
       uint32_t mb; memcpy(&mb, in + 4, 4);
       /* the main's base must be a valid network base, and not our own */
       const int okb = (mb & 0x80808080u) == 0 && (mb & 0x01010101u) == 0x01010101u && mb != net_base;
-      if (in[2] > 1 || (in[2] == 1 && (in[3] >= DML_SAT_MAX || !okb))) { *st = 2; return 1; }
+      if (in[2] > 1 || (in[2] == 1 && mb && (in[3] >= DML_SAT_MAX || !okb))) { *st = 2; return 1; }   /* base 0: picks a main itself */
       const int same = pairs.r.role == in[2] && (in[2] == 0 || (pairs.r.sat_id == in[3] && pairs.r.main_base == mb));
       if (in[2] == 1) { pairs.r.sat_id = in[3]; pairs.r.main_base = mb; pairs.r.sat_mask = 0; sat_on = 0; }
-      if (!same) { pairs.r.role = in[2]; pairs_save(); }      /* link_poll switches to it */
+      if (!same) { pairs.r.role = in[2]; pairs_save(); sv_started = 0; }   /* (another main, or auto: start over) */      /* link_poll switches to it */
     }
     d[0] = pairs.r.role; d[1] = pairs.r.sat_id; put32(d + 2, pairs.r.main_base); put32(d + 6, net_base);
     d[10] = sat_on; d[11] = role_run;

@@ -252,6 +252,22 @@ def repeater(a):
         if len(a) < 2 or a[1] not in ("on", "off") or me["role"]: sys.exit("repeater use on|off [ID], on a main")
         rid = int(a[2]) if len(a) > 2 else 0
         set_mask(h, me["mask"] & ~(1 << rid) | (1 << rid if a[1] == "on" else 0), False)
+    elif c == "auto":
+        if me["role"] == 0 and me["mask"]: sys.exit("this dongle uses repeaters itself")
+        st, _ = cmd(h, 0x3F, bytes([1, 0]) + struct.pack("<I", 0))
+        if st: sys.exit(f"the dongle refused ({st}): firmware 0x0032+")
+        print("repeater, picks a main itself")
+    elif c == "mains":
+        if not me["role"]: sys.exit("mains: on a repeater")
+        st, d = cmd(h, 0x3D, b"\2")
+        if st: sys.exit("firmware too old (0x0032+)")
+        print("network     -dBm  loss  repeaters")
+        for k in range(8):
+            e = d[1 + 7 * k: 8 + 7 * k]
+            if not u32(e, 0): continue
+            loss = "?" if e[5] == 0xFF else f"{e[5]}%"
+            reps = "?" if e[6] == 0xFF else f"{bin(e[6] & 3).count('1')}{' relaying' if e[6] & 0x80 else ''}"
+            print(f"{u32(e, 0):#010x}  {e[4]:4}  {loss:>4}  {reps}")
     elif c == "status":
         secs = float(a[1]) if len(a) > 1 else 2
         if me["role"]:
@@ -269,6 +285,15 @@ def repeater(a):
         print(f"main, network {me['net']:#010x}, repeaters in use {me['mask']:#x}, time reserved for them per cycle {y[0][34] | y[0][35] << 8} us"
               + ((", relaying now" if y[0][36] == 1 else f", not relaying, repeater useless: tried again in {y[0][37]} s" if y[0][37]
                  else ", not relaying (no loss)") if me['mask'] else ""))
+        st2, z = cmd(h, 0x3E, b"\2\0")
+        if not st2:
+            boards = {0: "Pro Micro", 1: "Holyiot", 2: "PCA10059", 3: "Kuroshin"}
+            leds = {0: "looking for a main", 1: "standby", 2: "relaying", 3: "weak signal"}
+            for k in range(2):
+                e = z[1 + 20 * k: 21 + 20 * k]   # base, id x8, board, fw x2, -dBm of main, led, -dBm at main, 0.1 s since
+                if not u32(e, 0): continue
+                print(f"  repeater {k}, wireless: {boards.get(e[12], '?')} {u32(e, 4):08X} fw {e[13] | e[14] << 8:#06x}, {leds.get(e[16], '?')}, "
+                      f"hears the main at -{e[15]} dBm, heard at -{e[17]} dBm, last asked {(e[18] | e[19] << 8) / 10:.1f} s ago")
         for k in range(2):
             o = 1 + 16 * k; ms = u32(y[0], o + 12)
             if me["mask"] >> k & 1:

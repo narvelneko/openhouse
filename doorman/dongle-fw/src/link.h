@@ -6,4 +6,4 @@ int  link_stream_pop(uint8_t *rep64, int itf);   /* the slots s with s % DONGLE_
 int  link_cmd(const uint8_t *in, uint8_t *d, uint8_t *st);
 void link_rssi_scan(uint8_t first, uint8_t *out, int n);
 void link_set_idle_hook(void (*f)(void));
-int  link_led(void);                             /* -1: main role (main.c's pattern); repeater: 1 synced, 0 searching */
+int  link_led(void);                             /* -1: main role (main.c's pattern); repeater: 0 looking for a main, 1 attached, 2 relaying, 3 weak signal to the main */

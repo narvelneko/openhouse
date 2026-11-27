@@ -74,6 +74,11 @@ enum { DML_POLL = 0x01, DML_RESP = 0x02, DML_JOIN = 0x03, DML_JREQ = 0x04 };
 #define DML_POLL_HDR       8
 #define DML_RESP_HDR       6
 #define DML_JOIN_LEN       21
+/* From dongle 0x0032 the beacon is 2 bytes longer (radios take >= DML_JOIN_LEN): [21] the worst device loss
+   %, as the main alone (0-100); [22] repeaters in use (bits 0-1) | 0x80 relaying now. Repeaters pick a main by them. */
+#define DML_JOIN_LEN_X     28
+/* [23] a repeater it took on its own: id | 0x80 (0: none) and [24..27] that repeater's net base. The main
+   names each such repeater in turn, so they know they still have their place. */
 /* Tagged feature reads: the host sends [0xC5][tag][report id]; the radio asks the main MCU with
    ['P'][report id] and sends the answer back as [0xC4][tag][answer without the 'P']. The main MCU's
    answers carry no id, so without the tag a late answer was taken for the next request. */
@@ -91,7 +96,14 @@ enum { DML_POLL = 0x01, DML_RESP = 0x02, DML_JOIN = 0x03, DML_JREQ = 0x04 };
 #define DML_JF_BATCH       0x04               /* JREQ: can send batches (doorman_lh2p.h); JOIN: do (for the assigned id) */
 #define DML_JF_BATCH32      0x08               /* with BATCH: wide batches, up to 32 frames (doorman_lh2p.h DMC_BATCH_W) */
 /* Repeater dongles: NEED / SREP (see above). */
-enum { DML_NEED = 0x06, DML_SREP = 0x07 };
+enum { DML_NEED = 0x06, DML_SREP = 0x07, DML_SREQ = 0x08 };
+/* SREQ [type][repeater net base x4][main net base x4]: a repeater without a set main asks for a place, in reply
+   to that main's JOIN (as a JREQ, same address), and again every few seconds to keep it. */
+#define DML_SREQ_LEN       9
+/* From 0x0032 it goes on with the repeater's status, for the host to show (a repeater on a charger has no USB):
+   [9..16] its device id (FICR DEVICEID[1], [0]: the USB serial), [17] board (cmd 0x30 byte 57), [18..19]
+   firmware, [20] -dBm it hears the main at, [21] its LED state (link_led). */
+#define DML_SREQ_LEN_X     22
 #define DML_SAT_PREFIX     0xC0u              /* + repeater id */
 #define DML_SAT_MAX        2
 #define DML_SAT_LISTEN     7                  /* slots a repeater listens to (radio addresses 1-7) */
