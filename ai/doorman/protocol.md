@@ -95,7 +95,14 @@ one that acks and decodes. Relaying works with the selective ack (`DML_F_SACK`):
 * A record from the cycle before fills the gap only: the main takes the device's hop timing, telemetry and
   downlink ack from answers to this cycle's POLL.
 
-While repeaters are in use every cycle is longer by a fixed reserve: 220 us per repeater plus what a full SREP
+The main relays only while some device loses answers, as the main alone (what a repeater took back counts as
+lost): on once one device's loss averaged over ~2 s reaches 4 %, off once every device's averaged over ~10 s is
+under 2.5 %. A repeater that took back under a tenth of what was lost over 10 s (at least 50 lost) isn't asked
+for 60 s. While it isn't relaying the main sends no NEEDs and its cycles are as without repeaters (idle
+repeaters cost the devices nothing); the repeater keeps time from the main's POLLs and JOIN beacons. Late
+answers are kept off while it relays (its cycles shift a little, and early POLLs doubled those devices' loss).
+
+While relaying every cycle is longer by a fixed reserve: 220 us per repeater plus what a full SREP
 needs beyond the join window, and the answer size is capped so the cycle stays within the 12.75 ms a POLL can
 announce. Re-poll (0x2F) is skipped while repeaters are in use. A repeater has 7 addresses for slots: with
 more than 7 devices the main names the 7 to listen to in each NEED, the ones that lost the most answers.
@@ -255,7 +262,7 @@ and `doorman_link.py`. Older two-interface firmware isn't supported.
 | 0x2A | identity: the slot's last `H` frame (16 B, zeros if none) |
 | 0x3C | main: repeaters in use `[mask, 0xFF reads][1: also save to flash now]` -> `[mask in use][mask saved]`. Applied in RAM; saved with byte 3 = 1, or by the dongle once no device is connected (a page erase halts the radio ~85 ms). Status 2 on a repeater |
 | 0x3D | repeater status `[page]`: 0 `[role][synced][sat id][channel]`, u32 from 4: cycles, NEEDs, SREPs; `[main -dBm at 16]`. 1: per slot RESPs heard (u32 x10 from 1), -dBm (x10 from 41). Totals |
-| 0x3E | main: relay stats `[page][first]`: 0 per repeater (16 B from 1+16k: asked, SREPs, taken, ms since its last SREP; u32), `[33 mask][34 reserve us u16]`. 1 `[first 0-4]`: 6 slots of 9 B: relayed, taken (u32), -dBm at the repeater. Totals; 0x23 counts an answer relayed in its own cycle as an answer |
+| 0x3E | main: relay stats `[page][first]`: 0 per repeater (16 B from 1+16k: asked, SREPs, taken, ms since its last SREP; u32), `[33 mask][34 reserve us u16][36 relaying now][37 s before a useless repeater is asked again]`. 1 `[first 0-4]`: 6 slots of 9 B: relayed, taken (u32), -dBm at the repeater. Totals; 0x23 counts an answer relayed in its own cycle as an answer |
 | 0x3F | role `[0/1, 0xFF reads][sat id 0-1][main net base u32]` -> `[role][sat id][main base u32][own net base u32][mask in use][role running]`. 1: a repeater of that main (kept in the pair page after the radio versions, applied at once; status 2 for an invalid base or its own). A repeater refuses 0x21 and 0x24. Firmware without repeaters: status 1 |
 
 ## Device frames (uplink, inside RESP)

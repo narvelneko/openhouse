@@ -266,7 +266,9 @@ def repeater(a):
         read = lambda: [cmd(h, 0x3E, p)[1] for p in (b"\0", b"\1\0", b"\1\4")] + [cmd(h, 0x23, bytes([i]))[1] for i in range(10)]
         x, _, y = read(), time.sleep(secs), read()
         d = lambda p, o: (u32(y[p], o) - u32(x[p], o)) / secs
-        print(f"main, network {me['net']:#010x}, repeaters in use {me['mask']:#x}, time reserved for them per cycle {y[0][34] | y[0][35] << 8} us")
+        print(f"main, network {me['net']:#010x}, repeaters in use {me['mask']:#x}, time reserved for them per cycle {y[0][34] | y[0][35] << 8} us"
+              + ((", relaying now" if y[0][36] == 1 else f", not relaying, repeater useless: tried again in {y[0][37]} s" if y[0][37]
+                 else ", not relaying (no loss)") if me['mask'] else ""))
         for k in range(2):
             o = 1 + 16 * k; ms = u32(y[0], o + 12)
             if me["mask"] >> k & 1:

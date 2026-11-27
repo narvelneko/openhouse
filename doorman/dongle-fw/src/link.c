@@ -1008,6 +1008,59 @@ typedef struct { uint32_t asks, sreps, acc, last_ms; uint16_t quiet; } satst_t;
 static GRP_M satst_t sats[DML_SAT_MAX];
 /* Per slot: answers relayed with the expected seq, answers taken, and its -dBm at the repeater. */
 static GRP_M struct { uint32_t relayed, acc; uint8_t rssi; } rly[DML_SLOTS];
+/* Relaying only while it's needed. A repeater in use costs every device on the main ~0.9 ms a cycle (the reserve
+   and the join window kept in every cycle), lossy or not, so the main relays only while some device loses
+   answers. Each slot's loss as the main alone (what the repeater took back counts as lost), per mille, is
+   averaged over ~2 s (fast) and ~10 s (slow): on once one's fast average reaches RU_ON_PCT %, off once every
+   slow one is under RU_OFF_PCT %. Single seconds were too noisy for this: clean devices at 1.5-1.8 % went over
+   2 % now and then and kept it on. A repeater that takes back under a tenth of what's lost over RU_USELESS_S
+   seconds (out of range, badly placed, unplugged), with at least RU_USELESS_N lost, isn't asked for
+   RU_BACKOFF_S seconds. (Judged per second, a slot losing ~20 a second fell short of the count now and then
+   and an unplugged repeater stayed in use, the join window kept in every cycle.) Meanwhile the repeater keeps time
+   from the main's POLLs and JOIN beacons. */
+#define RU_ON_PCT      4u
+#define RU_OFF_PCT_X10 25u             /* 2.5 % */
+#define RU_USELESS_S   10u
+#define RU_USELESS_N   50u
+#define RU_BACKOFF_S   60u
+static GRP_M uint8_t ru_on;                  /* relaying now */
+static GRP_M uint8_t ru_win_s;               /* seconds into the current RU_USELESS_S window */
+static GRP_M uint32_t ru_win_lost, ru_win_taken;   /* answers lost (as the main alone) and taken back in it */
+static GRP_M uint16_t ru_fast[DML_SLOTS], ru_slow[DML_SLOTS];   /* loss per mille, averaged ~2 s and ~10 s */
+static GRP_M uint16_t ru_backoff_s;          /* seconds left before a useless repeater is tried again */
+static GRP_M uint32_t ru_ms, ru_polls[DML_SLOTS], ru_lost[DML_SLOTS], ru_taken[DML_SLOTS];
+static void ru_tick(void)
+{
+  if (ms_ticks - ru_ms < 1000u) return;
+  ru_ms = ms_ticks;
+  uint32_t fast = 0, slow = 0, lost_all = 0, taken_all = 0;  /* the highest averages, per mille */
+  for (int i = 0; i < DML_SLOTS; i++) {
+    const slot_t *s = &sl[i];
+    const uint32_t polls = s->polls - ru_polls[i], lost = (s->polls - s->resp_ok) - ru_lost[i], taken = rly[i].acc - ru_taken[i];
+    ru_polls[i] = s->polls; ru_lost[i] = s->polls - s->resp_ok; ru_taken[i] = rly[i].acc;
+    if (!((plan >> i) & 1) || polls < 20) { ru_fast[i] = ru_slow[i] = 0; continue; }   /* (just joined or left) */
+    const uint32_t alone = lost + taken;
+    const uint32_t pm = 1000u * alone / polls;
+    ru_fast[i] = (uint16_t)((ru_fast[i] + pm) / 2u);
+    ru_slow[i] = (uint16_t)(ru_slow[i] + ((int32_t)pm - ru_slow[i]) / 8);
+    if (ru_fast[i] > fast) fast = ru_fast[i];
+    if (ru_slow[i] > slow) slow = ru_slow[i];
+    lost_all += alone; taken_all += taken;
+  }
+  if (ru_backoff_s) ru_backoff_s--;
+  if (!sat_on) { ru_on = 0; return; }
+  if (!ru_on) {
+    if (fast >= RU_ON_PCT * 10u && !ru_backoff_s) { ru_on = 1; ru_win_s = 0; ru_win_lost = ru_win_taken = 0; }
+    return;
+  }
+  ru_win_lost += lost_all; ru_win_taken += taken_all;
+  if (slow < RU_OFF_PCT_X10) { ru_on = 0; return; }
+  if (++ru_win_s >= RU_USELESS_S) {
+    if (ru_win_lost >= RU_USELESS_N && ru_win_taken * 10u < ru_win_lost) { ru_on = 0; ru_backoff_s = RU_BACKOFF_S; }
+    ru_win_s = 0; ru_win_lost = ru_win_taken = 0;
+  }
+}
+
 /* Writes the repeater ids in use (sat_on) to flash, if they changed. */
 static void sat_save(void) { if (pairs.r.sat_mask != sat_on) { pairs.r.sat_mask = sat_on; pairs_save(); } }
 
@@ -1489,7 +1542,8 @@ void link_poll(void)
      rarely full, so the cycle is shorter and every device is polled more often. Off: cmd 0x2D 0. */
   const uint32_t worst = 450u + 4u * max_resp;
   slot_us = adaptive && ex_budget ? (ex_budget + SLOT_GUARD_US < worst ? ex_budget + SLOT_GUARD_US : worst) : worst;
-  const int sat = sat_on || sat_r;                          /* once per cycle: the mask command can run mid-cycle */
+  ru_tick();
+  const int sat = (sat_on && ru_on) || sat_r;               /* once per cycle: the mask command can run mid-cycle */
   /* The join window (700 us) only in the cycles that send a JOIN beacon (every 20 ms): every cycle kept
      it, and at a 4.5 ms cycle three in four carried 700 us of nothing (15% of the cycle, longer between
      each device's polls). The others end JOIN_TAIL_US after their last slot. Radios take the period from
@@ -1501,7 +1555,7 @@ void link_poll(void)
   if (!plan) sat_save();
   if (sat) {                                                /* repeaters in use: room for NEEDs and SREPs */
     join_cyc = join_cyc || ms_ticks - last_join_ms + (period_us + 999u) / 1000u >= 20u;
-    const uint32_t want_r = sat_reserve();                  /* by <= 8 us a cycle, so devices don't drift */
+    const uint32_t want_r = sat_on && ru_on ? sat_reserve() : 0u;   /* by <= 8 us a cycle, so devices don't drift */
     sat_r = want_r > sat_r + 8u ? sat_r + 8u : want_r + 8u < sat_r ? sat_r - 8u : want_r;
     /* at most PERIOD_MAX_US: the POLL sends period/50 in a byte (period_us alone is within it: max_resp's cap) */
     sat_len = period_us + sat_r <= PERIOD_MAX_US ? period_us + sat_r : PERIOD_MAX_US;
@@ -1511,7 +1565,7 @@ void link_poll(void)
   } else sat_next_ok = 0;
   t_c += cycle_len;                                         /* the previous cycle's own length */
   cycle_len = period_us;
-  late_tick(period_us, 0);
+  late_tick(period_us, sat);                                /* off while relaying: early POLLs doubled the loss */
   if ((int32_t)(us_now() - t_c) > (int32_t)period_us || (int32_t)(t_c - us_now()) > (int32_t)period_us)
     t_c = us_now();                                         /* fell behind / first run: restart the plan */
   if (!hw || !n) wait_until(t_c);                           /* mode 3: the compare starts the first POLL */
@@ -1725,6 +1779,7 @@ int link_cmd(const uint8_t *in, uint8_t *d, uint8_t *st)    /* 0x20..0x2F, 0x32.
         put32(e + 12, q->last_ms ? ms_ticks - q->last_ms : 0xFFFFFFFFu);
       }
       d[33] = sat_on; d[34] = (uint8_t)sat_r; d[35] = (uint8_t)(sat_r >> 8);
+      d[36] = ru_on; d[37] = (uint8_t)(ru_backoff_s > 255 ? 255 : ru_backoff_s);   /* relaying now; s before a useless one is tried again */
     } else if (in[2] == 1) {                                /* 6 slots from [first 0-4], 9 B each */
       if (in[3] > DML_SLOTS - 6) { *st = 2; return 1; }
       for (int k = 0; k < 6; k++) {
