@@ -2716,12 +2716,15 @@ void Ui::LiveCycle(const DongleState& d) {
   const bool stale = !d.haveTiming || Now() - d.timingTime > 12;
   ImGui::PushFont(g_huge);
   const float big = ImGui::GetTextLineHeight();
+  const float digits = ImGui::CalcTextSize("00000").x;   // (five digits fit)
   ImGui::PopFont();
-  const float tileW = fs * 7, tileH = big + lh + fs * 1.1f;
+  const float tileW = std::max(fs * 7, digits + fs * 1.6f), tileH = big + lh + fs * 1.1f;
   char v[32];
-  if (d.haveTiming && d.cycleUs) std::snprintf(v, sizeof v, "%.0f", 1e6 / d.cycleUs); else std::snprintf(v, sizeof v, "-");
+  // No device connected: no cycle to speak of (only the join beacon's tail, ~0.1 ms).
+  const bool idle = d.joined == 0;
+  if (d.haveTiming && d.cycleUs && !idle) std::snprintf(v, sizeof v, "%.0f", 1e6 / d.cycleUs); else std::snprintf(v, sizeof v, "-");
   TileAt(dl, p, ImVec2(p.x + tileW, p.y + tileH), v, "cycles/s", kInfo);
-  if (d.haveTiming && d.cycleUs) std::snprintf(v, sizeof v, "%.1f", d.cycleUs / 1000.0); else std::snprintf(v, sizeof v, "-");
+  if (d.haveTiming && d.cycleUs && !idle) std::snprintf(v, sizeof v, "%.1f", d.cycleUs / 1000.0); else std::snprintf(v, sizeof v, "-");
   TileAt(dl, ImVec2(p.x + tileW + gap, p.y), ImVec2(p.x + tileW * 2 + gap, p.y + tileH), v, "ms", kText);
   // the bar: tick labels above, the parts, the legend under
   const float bx0 = p.x + tileW * 2 + gap * 2.5f, bx1 = p.x + W, barW = bx1 - bx0;
