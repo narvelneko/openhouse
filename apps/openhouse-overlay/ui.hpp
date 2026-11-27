@@ -9,6 +9,8 @@
 #include <map>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include "base_channels.hpp"
 #include "log_view.hpp"
@@ -33,6 +35,9 @@ class Ui {
   void Poll(double now);                // telemetry, replies
   void Draw(float width, float height);  // one frame, inside ImGui::NewFrame/Render
   bool QuitRequested() const { return quit_; }
+  // Repeaters with low signal for 5 s ("X and Y have low signal, bring them closer"), once each per 10 min:
+  // the caller shows them (SteamVR notification, desktop notification).
+  std::vector<std::string> TakeAlerts() { return std::exchange(alerts_, {}); }
   void SaveSettings() const;
 
  private:
@@ -46,6 +51,17 @@ class Ui {
   void SetBaseChannel(BaseChannelChange change, bool automatic = false);
   void CancelBaseChannelChange(const std::string& error);
   void Dongles();
+  struct RepeaterView {
+    std::string key, name, main;   // key: short serial (or main/id); name "Pro Micro 1041EDCB"; main: its dongle's name
+    bool wired = false, weak = false, notAnswering = false, useless = false, relaying = false;
+    int state = -1, hearsMain = 0, heard = 0;
+    double answersPerSec = 0, answeredShare = -1;   // share of the main's asks it answers, -1 too few to say
+  };
+  std::vector<RepeaterView> Repeaters(const viewer::State& s) const;
+  void RepeaterLine(const RepeaterView& v);
+  void CheckRepeaters(const viewer::State& s);
+  std::map<std::string, double> weakSince_, weakTold_;
+  std::vector<std::string> alerts_;
   void Map();
   void SettingsPage();
   void Debug();

@@ -291,8 +291,12 @@ class DoormanDongle {
   // status every second.
   int repFw_ = -1, roleTries_ = 0, roleSeq_ = -1;   // repFw_: -1 not known yet, 0 no, 1 answers 0x3F
   bool readRole_ = true;
-  std::array<int, 3> repSeq_{-1, -1, -1};           // pending seq: 0x3D p0; 0x3E p0 or 0x3D p1; 0x3E p1
-  int relayFirst_ = 0;                              // first slot of the last 0x3E page 1 request: 0 or 4
+  std::array<int, 4> repSeq_{-1, -1, -1, -1};       // pending seq: 0x3D p0; 0x3E p0 or 0x3D p1; 0x3E p1; 0x3E p2
+  int relayFirst_ = 0;
+  int autoMask_ = 0;
+  std::atomic<int> board_{-1};                      // info byte 57                                // repeaters that joined on their own (0x3E byte 38)
+  struct AutoInfo { uint32_t base = 0; std::string serial; int board = -1, firmware = 0, state = -1, hearsMain = 0; };
+  std::array<AutoInfo, 2> autoInfo_{};              // 0x3E page 2, per repeater id                              // first slot of the last 0x3E page 1 request: 0 or 4
   double nextRep_ = 0;
   DoormanRepeaterStatus rep_;                       // the reader thread's
   Totals satTotals_, slotTotals_[2], heardTotals_;

@@ -103,7 +103,9 @@ struct BatteryReport {
 // restart or role change.
 struct DoormanRepeaterStatus {
   std::string serial;       // the dongle's serial ("OHDG-...")
+  int board = -1;           // 0 Pro Micro, 1 Holyiot, 2 PCA10059, 3 Kuroshin (info byte 57), -1 not known
   int role = -1;            // -1: firmware without repeaters (or not read yet), 0 main, 1 repeater
+  bool autoRole = false;    // a repeater on its own (it heard a main with devices): still a dongle to pair to
   uint32_t netBase = 0;     // its own network base
   // main: the repeater ids it uses now (one bit each), and the status of each
   int mask = 0;
@@ -112,14 +114,26 @@ struct DoormanRepeaterStatus {
     bool answering = false;   // an answer (SREP) within the last 5 s
     double lastAnswer = -1;   // s since its last answer, -1 never
     double asksPerSec = 0, answersPerSec = 0;
+    // A repeater that joined on its own (firmware 0x0032+): what it sends over the air, so one on a charger
+    // shows too.
+    bool wireless = false;
+    std::string serial;       // its 8-hex short serial (the first half of "OHDG-..."), "" not known yet
+    int board = -1;           // 0 Pro Micro, 1 Holyiot, 2 PCA10059, 3 Kuroshin
+    int firmware = 0;
+    int state = -1;           // its LED state: 0 looking for a main, 1 standby, 2 relaying, 3 weak signal
+    int hearsMainRssi = 0;    // dBm it hears the main at, 0 unknown
+    int heardRssi = 0;        // dBm the main hears it at, 0 unknown
   };
   std::vector<Repeater> repeaters;
+  bool relaying = false;     // main: using its repeaters now (only while devices lose answers)
+  int uselessFor = 0;        // main: s before a repeater that didn't help is asked again (0: none)
   // repeater: its id and its main (mainSerial: the main's serial, if it's plugged in here too)
   int id = 0;
   uint32_t mainBase = 0;
   std::string mainSerial;
   bool following = false;   // in sync with the main (else searching)
   int mainRssi = 0;         // dBm, 0 unknown
+  int state = -1;           // its LED state (firmware 0x0032+): 0 looking for a main, 1 standby, 2 relaying, 3 weak signal
   std::array<double, 10> heardPerSec{};   // answers (RESPs) per second it hears, per slot of the main (DML_SLOTS)
   std::array<int, 10> heardRssi{};
 };

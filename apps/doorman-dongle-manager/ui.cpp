@@ -466,6 +466,23 @@ Sock SocketState(const DongleState::RelaySat& r, bool on, bool seen) {
   if (r.msSinceSrep <= 5000) return Sock::Weak;
   return Sock::Lost;
 }
+// A socket with what a repeater that joined on its own says of itself: weak signal (either way at -80 dBm or
+// worse, or it says so), live while the main relays and it answers, else standby. A gone one isn't in the mask
+// any more: the socket empties.
+Sock SockFor(const DongleState& d, int k, uint8_t mask, uint8_t known) {
+  const Sock st = SocketState(d.relaySats[k], mask & (1u << k), known & (1u << k));
+  if (!(d.autoMask >> k & 1) || st == Sock::Lost || st == Sock::Off || st == Sock::Empty) return st;
+  const auto& x = d.autoReps[k];
+  const int w = std::min(x.hearsMainRssi ? x.hearsMainRssi : 0, x.heardRssi ? x.heardRssi : 0);
+  const auto& r = d.relaySats[k];
+  const bool fewAnswers = d.relaying && r.asksPerSec >= 5 && r.srepsPerSec < 0.75 * r.asksPerSec;   // (at -70 dBm: 55-65 %)
+  if (x.state == 3 || (w && w <= -75) || d.uselessFor || fewAnswers) return Sock::Weak;   // (useless: it hears too little of the devices)
+  if (d.relaying && d.relaySats[k].msSinceSrep < 3000) return Sock::Live;
+  return Sock::Standby;
+}
+const char* BoardWord(int board) {
+  switch (board) { case 0: return "Pro Micro"; case 1: return "Holyiot"; case 2: return "PCA10059"; case 3: return "Kuroshin"; default: return "Dongle"; }
+}
 ImVec4 SockColor(Sock s) {
   switch (s) {
     case Sock::Live: return kGood;
@@ -510,7 +527,7 @@ void Ui::Sidebar(float height) {
   const auto& all = manager_.Dongles();
   if (all.size() > 1) {
     // each entry: the role's colour dot (the Repeater page's strip is the legend), then role and serial
-    const auto label = [](const DongleState& s) { return std::string("   ") + RoleName(RoleOf(s)) + " " + ShortSerial(s.serial); };
+    const auto label = [](const DongleState& s) { return std::string("  ") + BoardWord(s.board) + " " + ShortSerial(s.serial); };   // (the dot's color is its role)
     const float r = ImGui::GetFontSize() * 0.26f;
     std::string preview = dongle_;
     ImVec4 previewColor = kOff;
@@ -1953,7 +1970,7 @@ void Ui::RepeaterMain(const DongleState& d) {
   std::array<Sock, kMaxRepeaters> sock{};
   bool anyOn = false, anyAnswer = false, anyLost = false;
   for (int k = 0; k < kMaxRepeaters; ++k) {
-    sock[k] = SocketState(d.relaySats[k], mask & (1u << k), known & (1u << k));
+    sock[k] = SockFor(d, k, mask, known);
     anyOn |= (mask >> k) & 1;
     anyAnswer |= sock[k] == Sock::Live || sock[k] == Sock::Standby || sock[k] == Sock::Weak;
     anyLost |= sock[k] == Sock::Lost;
@@ -1982,7 +1999,7 @@ void Ui::RepeaterMain(const DongleState& d) {
   const float fs = ImGui::GetFontSize(), lh = ImGui::GetTextLineHeight(), fh = ImGui::GetFrameHeight(), px = Px(), tlh = TitleHeight();
   const float W = ImGui::GetContentRegionAvail().x, pad = fs * 0.6f;
   const ImVec2 p = ImGui::GetCursorScreenPos();
-  const float sockW = fs * 14, sockH = pad * 2 + tlh + fs * 0.3f + fh, sockGap = fs * 0.6f;
+  const float sockW = fs * 16, sockH = pad * 2 + tlh + fs * 0.3f + fh, sockGap = fs * 0.6f;
   const float bandH = sockH * kMaxRepeaters + sockGap * (kMaxRepeaters - 1), nodeW = fs * 9;
   const float sx = p.x + W - sockW;
   const ImVec2 na(p.x, p.y), nb(p.x + nodeW, p.y + bandH);
@@ -2037,10 +2054,12 @@ void Ui::RepeaterMain(const DongleState& d) {
     Card(dl, a, b, sc, st == Sock::Off ? 0.4f : 0.75f, st == Sock::Off ? 1.f : 1.5f);
     // row 1: icon, R1, (?) and the NO ANSWER mark
     const float iy = a.y + pad;
-    lh::ui::DrawIcon(dl, Icon::Repeater, ImVec2(a.x + pad + tlh / 2, iy + tlh / 2), tlh, U32(kAccent, st == Sock::Off ? 0.6f : 1));
-    TextAt(dl, ImVec2(a.x + pad + tlh + fs * 0.45f, iy), kAccent, RName(k).c_str(), g_title);
-    if (!who[k].empty())
-      TextAt(dl, ImVec2(a.x + pad + tlh + fs * 0.9f + TextSize(RName(k).c_str(), g_title).x, iy + (tlh - lh) / 2), kMuted, "USB");
+    const bool wireless = d.autoMask >> k & 1;
+    const auto& ar = d.autoReps[k];
+    const std::string title = wireless && !ar.serial.empty() ? std::string(BoardWord(ar.board)) + " " + ar.serial : RName(k);
+    lh::ui::DrawIcon(dl, wireless && who[k].empty() ? Icon::Wireless : who[k].empty() ? Icon::Repeater : Icon::Wire,
+                     ImVec2(a.x + pad + tlh / 2, iy + tlh / 2), tlh, U32(kAccent, st == Sock::Off ? 0.6f : 1));
+    TextAt(dl, ImVec2(a.x + pad + tlh + fs * 0.45f, iy), kAccent, title.c_str(), wireless ? nullptr : g_title);
     ImGui::SetCursorScreenPos(ImVec2(b.x - pad - lh, iy + (tlh - lh) / 2));
     InfoHover("switch", kInfoSwitchText);
     if (st == Sock::Lost && std::fmod(now_, 1.0) < 0.6) {
@@ -2052,14 +2071,18 @@ void Ui::RepeaterMain(const DongleState& d) {
     const float ry = iy + tlh + fs * 0.3f;
     ImGui::SetCursorScreenPos(ImVec2(a.x + pad, ry));
     const bool on = mask & (1u << k);
-    if (PowerSwitch("power", on, on ? (st == Sock::Lost ? kBad : kGood) : kOff)) {
+    if (wireless) {   // joined on its own: the main keeps it while it answers, no switch
+      TextAt(dl, ImVec2(a.x + pad, ry + (fh - lh) / 2), kMuted, who[k].empty() ? "WIRELESS" : "USB");
+    } else if (PowerSwitch("power", on, on ? (st == Sock::Lost ? kBad : kGood) : kOff)) {
       const uint8_t next = uint8_t(on ? mask & ~(1u << k) : mask | (1u << k));
       maskPending_[d.serial] = {next, now_ + 3};
       const std::string word = RName(k) + (on ? " off" : " on");
       dongle->SetRepeaters(next, false, [this, word](bool ok, const std::string& msg) { Post(ok ? word : "Switch failed: " + msg, ok); });
     }
-    const float swEnd = ImGui::GetItemRectMax().x;
-    TextAt(dl, ImVec2(swEnd + fs * 0.4f, ry + (fh - lh) / 2), on ? kText : kOff, on ? "ON" : "OFF");
+    if (!wireless) {
+      const float swEnd = ImGui::GetItemRectMax().x;
+      TextAt(dl, ImVec2(swEnd + fs * 0.4f, ry + (fh - lh) / 2), on ? kText : kOff, on ? "ON" : "OFF");
+    }
     if (st != Sock::Off) {
       const bool pips = st != Sock::Lost;
       const float r2 = fs * 0.22f, pipsW = pips ? r2 * 2.7f * 3 : 0;
@@ -2069,10 +2092,15 @@ void Ui::RepeaterMain(const DongleState& d) {
       if (st == Sock::Live || st == Sock::Weak) HealthPips(dl, ImVec2(wx, ry + fh / 2), r2, st == Sock::Weak ? 1 : AnswerPips(r), sc, false);
       else if (st == Sock::Standby) HealthPips(dl, ImVec2(wx, ry + fh / 2), r2, 0, sc, true);
     }
-    char tip[200];
+    char tip[320];
     const std::string last = r.msSinceSrep == 0xFFFFFFFFu ? "-" : [&] { char t[24]; std::snprintf(t, sizeof t, "%.1f s", r.msSinceSrep / 1000.0); return std::string(t); }();
     std::snprintf(tip, sizeof tip, "Last answer %s\nAsked %.0f/s\nAnswered %.0f/s\nTaken %.0f/s%s%s", last.c_str(), r.asksPerSec, r.srepsPerSec,
                   r.acceptedPerSec, who[k].empty() ? "" : "\n", who[k].c_str());
+    if (wireless) {
+      const size_t n = std::strlen(tip);
+      std::snprintf(tip + n, sizeof tip - n, "\nJoined on its own\nHears the main at %d dBm\nHeard at %d dBm%s", ar.hearsMainRssi, ar.heardRssi,
+                    d.uselessFor ? "\nNot helping: it hears too little of the devices. Move it" : d.relaying ? "" : "\nStandby: nothing is lost, so it isn't asked");
+    }
     AreaTip(a, b, tip);
     ImGui::PopID();
   }

@@ -54,7 +54,7 @@ std::string PairingMailbox::Discover(Session& session, const std::string& expect
             {"expectedControllerType", expected}};
   std::vector<std::string> repeaters;   // a repeater dongle has no devices of its own: not a pairing target
   for (const auto& d : session.DoormanDongles())
-    if (d.role == 1) repeaters.push_back(d.serial + "/");
+    if (d.role == 1 && !d.autoRole) repeaters.push_back(d.serial + "/");   // (one on its own turns back when pairing starts)
   for (const auto& r : session.Receivers())
     if (std::none_of(repeaters.begin(), repeaters.end(), [&](const std::string& p) { return r.serial.rfind(p, 0) == 0; }))
       j["dongles"].push_back({{"serial", r.serial}, {"firmwareVersion", ""}, {"connectedSerial", r.connected}});

@@ -82,7 +82,7 @@ static GRP_M uint8_t sat_on;
 static GRP_M uint8_t sat_auto, sat_annc;
 /* How strongly the main hears each repeater (its SREPs and SREQs), -dBm x16. Weaker than SAT_WEAK_DBM costs
    relays (the driver tells the user to bring them closer; the repeater flashes its LED). */
-#define SAT_WEAK_DBM 80u
+#define SAT_WEAK_DBM 75u   /* (at ~-70 dBm a repeater already answered only 55-65 % of the NEEDs) */
 static GRP_M uint16_t sat_rssi16[2];
 static GRP_M uint8_t sat_info[2][DML_SREQ_LEN_X - DML_SREQ_LEN];   /* each auto repeater's status (SREQ from byte 9) */
 static void sat_rssi_add(int k, uint8_t v) { sat_rssi16[k] = sat_rssi16[k] ? (uint16_t)(sat_rssi16[k] - sat_rssi16[k] / 8 + v * 2) : (uint16_t)(v * 16); }
@@ -1068,7 +1068,7 @@ static GRP_M struct { uint32_t relayed, acc; uint8_t rssi; } rly[DML_SLOTS];
 #define RU_OFF_PCT_X10 25u             /* 2.5 % */
 #define RU_USELESS_S   10u
 #define RU_USELESS_N   50u
-#define RU_BACKOFF_S   60u
+#define RU_BACKOFF_S   15u
 static GRP_M uint8_t ru_on;                  /* relaying now */
 static GRP_M uint8_t ru_win_s;               /* seconds into the current RU_USELESS_S window */
 static GRP_M uint32_t ru_win_lost, ru_win_taken;   /* answers lost (as the main alone) and taken back in it */
@@ -2003,7 +2003,7 @@ int link_cmd(const uint8_t *in, uint8_t *d, uint8_t *st)    /* 0x20..0x2F, 0x32.
       return 1;
     }
     if (in[2]) { *st = 2; return 1; }
-    d[0] = pairs.r.role; d[1] = link_led() > 0; d[30] = (uint8_t)link_led(); d[2] = sv_id; d[3] = sv_ch; put32(d + 17, sv_mbase);   /* (the main it follows: auto too) */
+    d[0] = role_run; d[1] = link_led() > 0;   /* the role it runs: a repeater on its own too */ d[30] = (uint8_t)link_led(); d[2] = sv_id; d[3] = sv_ch; put32(d + 17, sv_mbase);   /* (the main it follows: auto too) */
     put32(d + 4, sv_cycles); put32(d + 8, sv_needs); put32(d + 12, sv_sreps); d[16] = (uint8_t)(sv_mrssi16 / 16);
     return 1;
   case 0x3E:                                                /* main: relay stats [page][first]; totals */

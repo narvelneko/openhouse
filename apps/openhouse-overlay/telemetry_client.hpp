@@ -62,8 +62,18 @@ struct Receiver {
 // A Doorman dongle's repeater role and status. Only dongles whose firmware has repeaters are listed.
 struct Dongle {
   std::string serial, role, netBase;   // role "main" or "repeater"
-  struct Repeater { int id = 0; bool answering = false; double lastAnswer = -1, asksPerSec = 0, answersPerSec = 0; };
+  int board = -1;                      // 0 Pro Micro, 1 Holyiot, 2 PCA10059, 3 Kuroshin
+  bool autoRole = false;               // repeater: on its own, a dongle again once it pairs or its device turns on
+  struct Repeater {
+    int id = 0; bool answering = false; double lastAnswer = -1, asksPerSec = 0, answersPerSec = 0;
+    bool wireless = false;             // joined on its own over the air: what it said of itself
+    std::string serial;                // 8-hex short serial, "" unknown
+    int board = -1, firmware = 0, state = -1, hearsMainRssi = 0, heardRssi = 0;   // state: 0 looking, 1 standby, 2 relaying, 3 weak
+  };
   std::vector<Repeater> repeaters;     // main: the repeaters it uses
+  bool relaying = false;               // main: using them now
+  int uselessFor = 0;
+  int state = -1;                      // repeater: its LED state
   int repeaterId = 0;                  // repeater: its id, and its main's serial if that's plugged in here too
   std::string main, mainBase;
   bool following = false;

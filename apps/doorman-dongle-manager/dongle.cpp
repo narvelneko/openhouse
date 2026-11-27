@@ -576,10 +576,13 @@ void Dongle::PollRepeater(double now) {
   {
     std::lock_guard lock(mutex_);
     state_.haveRole = true;
-    state_.role = role;
+    state_.autoRepeater = role == 0 && running == 1;
+    state_.role = state_.autoRepeater ? 1 : role;   // the UI treats it as the repeater it is now
     state_.roleRunning = running;
-    state_.satId = r.data[1] < kMaxRepeaters ? r.data[1] : 0;   // the UI shifts by it
-    state_.mainBase = Rd32(r.data.data() + 2);
+    if (!state_.autoRepeater) {   // (one on its own: its main and id come with 0x3D)
+      state_.satId = r.data[1] < kMaxRepeaters ? r.data[1] : 0;   // the UI shifts by it
+      state_.mainBase = Rd32(r.data.data() + 2);
+    }
     state_.netBase = Rd32(r.data.data() + 6);
     state_.satMask = r.data[10];
   }
@@ -600,8 +603,26 @@ void Dongle::PollRepeater(double now) {
       const uint8_t* e = entry(i);
       for (int j = 0; j < 2; ++j) c.slot[i][j] = Rd32(e + 4 * j);   // relayed, taken
     }
+    Reply z;
+    const bool fw32 = a.data[38] != 0 || a.data[52] != 0 || a.data[53] != 0;   // (older firmware leaves these 0)
+    const uint8_t p3[2] = {2, 0};
+    const bool haveAuto = (a.data[38] & 3) && Command(kRelayStats, p3, 2, &z);
     std::lock_guard lock(mutex_);
     state_.reserveUs = a.data[34] | a.data[35] << 8;
+    state_.relaying = a.data[36] == 1;
+    state_.uselessFor = fw32 ? a.data[37] : 0;
+    state_.autoMask = a.data[38] & 3;
+    for (int k = 0; k < kMaxRepeaters; ++k) {
+      auto& x = state_.autoReps[k];
+      if (!(state_.autoMask >> k & 1)) { x = {}; continue; }
+      x.heardRssi = fw32 && a.data[52 + k] ? -int(a.data[52 + k]) : 0;
+      if (!haveAuto) continue;
+      const uint8_t* e = z.data.data() + 1 + 20 * k;   // base, id x8, board, fw x2, -dBm of the main, LED state, ...
+      char b[9];
+      std::snprintf(b, sizeof b, "%08X", unsigned(Rd32(e + 4)));
+      x.serial = Rd32(e + 4) ? b : "";
+      x.board = e[12]; x.firmware = e[13] | e[14] << 8; x.state = e[16]; x.hearsMainRssi = e[15] ? -int(e[15]) : 0;
+    }
     for (int k = 0; k < kMaxRepeaters; ++k) {
       auto& s = state_.relaySats[k];
       s.msSinceSrep = Rd32(a.data.data() + 1 + 16 * k + 12);
@@ -624,6 +645,8 @@ void Dongle::PollRepeater(double now) {
     for (int i = 0; i < kSlots; ++i) c.heard[i] = Rd32(b.data.data() + 1 + 4 * i);
     std::lock_guard lock(mutex_);
     state_.satSynced = d[1];
+    state_.satState = state_.firmware >= 0x0032 ? d[30] : -1;
+    if (Rd32(d + 17)) { state_.mainBase = Rd32(d + 17); state_.satId = d[2] < kMaxRepeaters ? d[2] : 0; }   // the main it chose itself
     state_.satChannel = d[3];
     state_.satMainRssi = d[16] ? -int(d[16]) : 0;
     for (int i = 0; i < kSlots; ++i) state_.satHeardRssi[i] = b.data[41 + i] ? -int(b.data[41 + i]) : 0;

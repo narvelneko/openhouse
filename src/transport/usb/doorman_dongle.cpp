@@ -195,7 +195,7 @@ bool DoormanDongle::TakeOpened() {
   sentHome_ = -1;               // it may still have a home from before (until it's unplugged): told again
   Send(kCmdInfo, nullptr, 0);   // how many slots it has
   nextLive_ = 0;
-  repFw_ = -1; roleTries_ = 0; roleSeq_ = -1; repSeq_ = {-1, -1, -1}; readRole_ = true; nextRep_ = 0;
+  repFw_ = -1; roleTries_ = 0; roleSeq_ = -1; repSeq_ = {-1, -1, -1, -1}; readRole_ = true; nextRep_ = 0;
   rep_ = {};
   satTotals_ = slotTotals_[0] = slotTotals_[1] = heardTotals_ = {};
   log_(LogLevel::Info, "Doorman Dongle " + serial_ + " opened");
@@ -619,8 +619,9 @@ void DoormanDongle::OnReport(double t, const uint8_t* r, int n, bool last) {
     repFw_ = 1;
     readRole_ = false;
     const int running = d[11];
-    const uint32_t mainBase = Rd32(d + 2);
-    if (running != rep_.role || (running == 1 && (d[1] != rep_.id || mainBase != rep_.mainBase))) {
+    const bool autoRole = d[0] == 0 && running == 1;   // a repeater on its own: the main it chose comes with 0x3D
+    const uint32_t mainBase = autoRole ? rep_.mainBase : Rd32(d + 2);
+    if (running != rep_.role || (running == 1 && !autoRole && (d[1] != rep_.id || mainBase != rep_.mainBase))) {
       char b[96];
       if (running == 1) std::snprintf(b, sizeof b, ": repeater %d of the main with network base %08X", d[1], unsigned(mainBase));
       else std::snprintf(b, sizeof b, ": main, repeaters in use 0x%X", d[10]);
@@ -628,7 +629,7 @@ void DoormanDongle::OnReport(double t, const uint8_t* r, int n, bool last) {
       rep_ = {};
       for (auto& s : slots_) s.relayedPs = s.takenPs = -1;
     }
-    rep_.role = running; rep_.id = d[1]; rep_.mainBase = mainBase; rep_.netBase = Rd32(d + 6); rep_.mask = d[10];
+    rep_.role = running; rep_.autoRole = autoRole; if (!autoRole) rep_.id = d[1]; rep_.mainBase = mainBase; rep_.netBase = Rd32(d + 6); rep_.mask = d[10];
     nextRep_ = 0;
   } else if ((r[0] == kCmdRepStatus || r[0] == kCmdRelay) && r[2] == 0 && n >= 63 &&
              std::find(repSeq_.begin(), repSeq_.end(), r[1]) != repSeq_.end()) {
@@ -644,7 +645,8 @@ void DoormanDongle::OnReport(double t, const uint8_t* r, int n, bool last) {
       break;
     }
   } else if (r[0] == kCmdInfo && n >= 64 && std::memcmp(r + 3, "OHDG", 4) == 0) {
-    slotCount_ = r[63] >= 1 && r[63] <= kSlots ? r[63] : 8;   // 0 from firmware before 0x002A: 8 slots
+    slotCount_ = r[63] >= 1 && r[63] <= kSlots ? r[63] : 8;
+    board_ = r[3 + 57];   // 0 from firmware before 0x002A: 8 slots
     const int firmware = r[7] | r[8] << 8;
     if (firmware != firmware_) {
       firmware_ = firmware;
@@ -713,6 +715,11 @@ void DoormanDongle::PollRepeater(double now) {
   }
   Send(kCmdRelay, p0, 2);
   repSeq_[1] = seq_;
+  if (autoMask_) {                         // repeaters that joined on their own: who they are
+    const uint8_t a2[2] = {2, 0};
+    Send(kCmdRelay, a2, 2);
+    repSeq_[3] = seq_;
+  }
   if (!rep_.mask) return;
   bool high = false;
   for (int i = 6; i < kSlots; ++i) high |= slots_[i].used;
@@ -740,6 +747,8 @@ void DoormanDongle::OnRepeaterReply(double t, uint8_t cmd, int kind, const uint8
     if (rep_.role == 1) {
       rep_.following = d[1] != 0;
       rep_.mainRssi = d[16] ? -int(d[16]) : 0;
+      rep_.state = firmware_ >= 0x0032 ? d[30] : -1;
+      if (firmware_ >= 0x0032 && Rd32(d + 17)) { rep_.mainBase = Rd32(d + 17); rep_.id = d[2]; }   // the main it chose itself
     }
   } else if (cmd == kCmdRepStatus && rep_.role == 1) {   // 0x3D page 1: per slot RESPs heard (from 1), -dBm (from 41)
     uint32_t v[kSlots];
@@ -752,6 +761,9 @@ void DoormanDongle::OnRepeaterReply(double t, uint8_t cmd, int kind, const uint8
     }
   } else if (cmd == kCmdRelay && kind == 1 && rep_.role == 0) {   // 0x3E page 0: per repeater
     rep_.mask = d[33];
+    rep_.relaying = d[36] == 1;
+    rep_.uselessFor = d[37];
+    autoMask_ = firmware_ >= 0x0032 ? d[38] & 3 : 0;
     uint32_t v[4];
     double r[4];
     for (int k = 0; k < 2; ++k) { v[2 * k] = Rd32(d + 1 + 16 * k); v[2 * k + 1] = Rd32(d + 1 + 16 * k + 4); }   // asked, SREPs
@@ -765,10 +777,30 @@ void DoormanDongle::OnRepeaterReply(double t, uint8_t cmd, int kind, const uint8
       x.lastAnswer = ms == 0xFFFFFFFFu ? -1 : ms / 1000.0;
       x.answering = ms < 5000;
       if (ok) { x.asksPerSec = r[2 * k]; x.answersPerSec = r[2 * k + 1]; }
+      x.wireless = autoMask_ >> k & 1;
+      if (firmware_ >= 0x0032 && d[52 + k]) x.heardRssi = -int(d[52 + k]);
+      if (x.wireless) {   // what page 2 said last, if it's the same repeater
+        const auto& w = autoInfo_[size_t(k)];
+        if (w.base == Rd32(d + 39 + 4 * k)) { x.serial = w.serial; x.board = w.board; x.firmware = w.firmware; x.state = w.state; x.hearsMainRssi = w.hearsMain; }
+      }
       rep_.repeaters.push_back(x);
     }
     if (!rep_.mask)
       for (auto& s : slots_) s.relayedPs = s.takenPs = -1;
+  } else if (cmd == kCmdRelay && kind == 3 && rep_.role == 0) {   // 0x3E page 2: repeaters that joined on their own
+    for (int k = 0; k < 2; ++k) {
+      const uint8_t* e = d + 1 + 20 * k;   // base, id x8, board, fw x2, -dBm of the main, LED state, -dBm at the main, 0.1 s
+      auto& w = autoInfo_[size_t(k)];
+      w = {};
+      w.base = Rd32(e);
+      if (!w.base) continue;
+      char b[9];
+      std::snprintf(b, sizeof b, "%08X", unsigned(Rd32(e + 4)));
+      if (Rd32(e + 4)) w.serial = b;
+      w.board = e[12]; w.firmware = e[13] | e[14] << 8; w.state = e[16]; w.hearsMain = e[15] ? -int(e[15]) : 0;
+      for (auto& x : rep_.repeaters)
+        if (x.id == k && x.wireless) { x.serial = w.serial; x.board = w.board; x.firmware = w.firmware; x.state = w.state; x.hearsMainRssi = w.hearsMain; }
+    }
   } else if (cmd == kCmdRelay && kind == 2 && rep_.role == 0) {   // 0x3E page 1: 6 slots from relayFirst_
     const int first = relayFirst_;
     uint32_t v[12];
@@ -1236,7 +1268,9 @@ std::vector<DoormanDongle::SlotStat> DoormanDongle::SlotStats() const {
 
 DoormanRepeaterStatus DoormanDongle::Repeater() const {
   std::lock_guard lock(mutex_);
-  return opened_ ? repCache_ : DoormanRepeaterStatus();
+  DoormanRepeaterStatus x = opened_ ? repCache_ : DoormanRepeaterStatus();
+  x.board = board_;
+  return x;
 }
 
 void DoormanDongle::RefreshStatsCache() {     // reader thread: slots_ is its own

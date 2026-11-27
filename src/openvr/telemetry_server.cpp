@@ -167,20 +167,22 @@ void TelemetryServer::PublishState(double time, const SessionSnapshot& snapshot,
   for (const auto& p : doormanDongles) {
     char base[12];
     std::snprintf(base, sizeof base, "%08X", unsigned(p.netBase));
-    json e = {{"serial", p.serial}, {"role", p.role == 1 ? "repeater" : "main"}, {"netBase", base}};
+    json e = {{"serial", p.serial}, {"role", p.role == 1 ? "repeater" : "main"}, {"netBase", base}, {"board", p.board}, {"auto", p.autoRole}};
     if (p.role == 0) {
       json reps = json::array();
       for (const auto& x : p.repeaters)
         reps.push_back({{"id", x.id}, {"answering", x.answering}, {"lastAnswer", x.lastAnswer},
-                        {"asksPerSec", x.asksPerSec}, {"answersPerSec", x.answersPerSec}});
-      e["repeaterMask"] = p.mask; e["repeaters"] = reps;
+                        {"asksPerSec", x.asksPerSec}, {"answersPerSec", x.answersPerSec}, {"wireless", x.wireless},
+                        {"serial", x.serial}, {"board", x.board}, {"firmware", x.firmware}, {"state", x.state},
+                        {"hearsMainRssi", x.hearsMainRssi}, {"heardRssi", x.heardRssi}});
+      e["repeaterMask"] = p.mask; e["repeaters"] = reps; e["relaying"] = p.relaying; e["uselessFor"] = p.uselessFor;
     } else {
       std::snprintf(base, sizeof base, "%08X", unsigned(p.mainBase));
       json heard = json::array();
       for (size_t i = 0; i < p.heardPerSec.size(); ++i)
         if (p.heardPerSec[i] > 0) heard.push_back({{"slot", i}, {"perSec", p.heardPerSec[i]}, {"rssi", p.heardRssi[i]}});
       e["repeaterId"] = p.id; e["mainBase"] = base; e["main"] = p.mainSerial; e["following"] = p.following;
-      e["mainRssi"] = p.mainRssi; e["heard"] = heard;
+      e["mainRssi"] = p.mainRssi; e["heard"] = heard; e["state"] = p.state;
     }
     dongles.push_back(std::move(e));
   }

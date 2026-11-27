@@ -98,9 +98,32 @@ one that acks and decodes. Relaying works with the selective ack (`DML_F_SACK`):
 The main relays only while some device loses answers, as the main alone (what a repeater took back counts as
 lost): on once one device's loss averaged over ~2 s reaches 4 %, off once every device's averaged over ~10 s is
 under 2.5 %. A repeater that took back under a tenth of what was lost over 10 s (at least 50 lost) isn't asked
-for 60 s. While it isn't relaying the main sends no NEEDs and its cycles are as without repeaters (idle
+for 15 s. While it isn't relaying the main sends no NEEDs and its cycles are as without repeaters (idle
 repeaters cost the devices nothing); the repeater keeps time from the main's POLLs and JOIN beacons. Late
 answers are kept off while it relays (its cycles shift a little, and early POLLs doubled those devices' loss).
+
+Automatic repeaters (dongle 0x0032). Every dongle starts as a normal one. With no device connected it
+listens on the join channel for 22 ms once a second; hearing a JOIN from another main with devices (byte 22
+bit 0x40) it becomes a repeater (RAM only). It's a dongle again after 15 s without hearing such a main, when
+pairing opens on it (0x24), or when one of its own paired devices answers the short JOIN it sends every 100 ms
+while it has pairings. Two dongles without devices both stay dongles. A repeater set by hand (0x3F with a main)
+stays one; 0x3F with main base 0 makes one that picks its main itself.
+
+A repeater on its own picks the main losing the most (JOIN byte 21), then the one with fewer repeaters, then
+the strongest, and asks it for a place with an SREQ in reply to its JOIN. The main gives it a free repeater id
+and names it in its JOINs (bytes 23-27, the auto repeaters in turn); no place within 2 s and it tries another
+main (that one is skipped for 30 s). It sends the SREQ again every 4 s from the JOIN, with its status (serial,
+board, firmware, how it hears the main, LED state), and the main drops it 12 s after its last SREQ or SREP.
+Once a minute it moves to a main losing 10 points more than its own. None of this is saved to flash.
+
+JOIN from 0x0032: 28 bytes. [21] worst device loss % as the main alone; [22] repeaters in use (bits 0-1),
+0x40 devices connected, 0x80 relaying now; [23] an auto repeater's id | 0x80 (0: none), [24..27] its net base.
+Radios take any JOIN of at least 21 bytes.
+
+LED (link_led): relaying solid (green on RGB), attached and idle a slow 2 s pulse (orange), weak signal to
+its main (-75 dBm or worse) a fast flash (orange), looking for a main a short blink twice a second (blue). All
+LEDs are on PWM; the Holyiot and PCA10059 RGB LED is red P0.08, green P1.09, blue P0.12. Kuroshin and the
+Index board drive no LED.
 
 While relaying every cycle is longer by a fixed reserve: 220 us per repeater plus what a full SREP
 needs beyond the join window, and the answer size is capped so the cycle stays within the 12.75 ms a POLL can
@@ -261,8 +284,11 @@ and `doorman_link.py`. Older two-interface firmware isn't supported.
 | 0x29 | live `[first]` (6 slots per reply, as 0x25): per slot `[used\|active<<1][rssi last rx][rssi last tx][min][max][channel][ms since reply u32]`. Min/max reset on read |
 | 0x2A | identity: the slot's last `H` frame (16 B, zeros if none) |
 | 0x3C | main: repeaters in use `[mask, 0xFF reads][1: also save to flash now]` -> `[mask in use][mask saved]`. Applied in RAM; saved with byte 3 = 1, or by the dongle once no device is connected (a page erase halts the radio ~85 ms). Status 2 on a repeater |
-| 0x3D | repeater status `[page]`: 0 `[role][synced][sat id][channel]`, u32 from 4: cycles, NEEDs, SREPs; `[main -dBm at 16]`. 1: per slot RESPs heard (u32 x10 from 1), -dBm (x10 from 41). Totals |
-| 0x3E | main: relay stats `[page][first]`: 0 per repeater (16 B from 1+16k: asked, SREPs, taken, ms since its last SREP; u32), `[33 mask][34 reserve us u16][36 relaying now][37 s before a useless repeater is asked again]`. 1 `[first 0-4]`: 6 slots of 9 B: relayed, taken (u32), -dBm at the repeater. Totals; 0x23 counts an answer relayed in its own cycle as an answer |
+| 0x3D | repeater status `[page]`: 0 `[role running][synced][sat id][channel]`, u32 from 4: cycles, NEEDs, SREPs; `[main -dBm at 16]`, from 0x0032 `[17 main followed u32][30 LED state]`. 2: mains heard, 8 x 7 B from 1 (base u32, -dBm, loss %, JOIN byte 22). 1: per slot RESPs heard (u32 x10 from 1), -dBm (x10 from 41). Totals |
+| 0x3E | main: relay stats `[page][first]`: 0 per repeater (16 B from 1+16k: asked, SREPs, taken, ms since its last SREP; u32), `[33 mask][34 reserve us u16][36 relaying now][37 s before a useless repeater is asked again][38 auto repeaters
+mask][39 and 43 their net bases u32][52, 53 -dBm the main hears each repeater at]`. Page 2 (0x0032): per auto
+repeater 20 B from 1+20k: net base u32, SREQ bytes 9-21 (device id x8, board, firmware u16, -dBm of the main,
+LED state), -dBm at the main, 0.1 s since its last SREQ u16. 1 `[first 0-4]`: 6 slots of 9 B: relayed, taken (u32), -dBm at the repeater. Totals; 0x23 counts an answer relayed in its own cycle as an answer |
 | 0x3F | role `[0/1, 0xFF reads][sat id 0-1][main net base u32]` -> `[role][sat id][main base u32][own net base u32][mask in use][role running]`. 1: a repeater of that main (kept in the pair page after the radio versions, applied at once; status 2 for an invalid base or its own). A repeater refuses 0x21 and 0x24. Firmware without repeaters: status 1 |
 
 ## Device frames (uplink, inside RESP)

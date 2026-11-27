@@ -125,6 +125,15 @@ struct DongleState {
   // main: per repeater id, rates over the last second
   struct RelaySat { double asksPerSec = 0, srepsPerSec = 0, acceptedPerSec = 0; uint32_t msSinceSrep = 0xFFFFFFFF; };
   std::array<RelaySat, kMaxRepeaters> relaySats{};
+  // main (firmware 0x0032+): relaying now (only while devices lose answers), and the repeaters that joined on
+  // their own over the air, with what they said of themselves
+  bool relaying = false;
+  int uselessFor = 0;                  // s before a repeater that took back too little is asked again (0: none)
+  uint8_t autoMask = 0;
+  struct AutoRep { std::string serial; int board = -1, firmware = 0, state = -1, hearsMainRssi = 0, heardRssi = 0; };
+  std::array<AutoRep, kMaxRepeaters> autoReps{};
+  bool autoRepeater = false;           // a repeater on its own (it heard a main with devices); stored role 0
+  int satState = -1;                   // repeater: its LED state, 0 looking, 1 standby, 2 relaying, 3 weak
   // main: per slot, over the last second: answers relayed by a repeater, and taken in order
   std::array<double, kSlots> relayRelayedPerSec{}, relayAcceptedPerSec{};
   std::array<int, kSlots> relaySatRssi{};   // dBm at the repeater (its last SREP), 0 none

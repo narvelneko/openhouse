@@ -91,6 +91,18 @@ GLuint UploadRgba(const uint8_t* rgba, int w, int h) {
 }
 
 // ---- the desktop window ----
+// A desktop notification (Linux): repeater warnings. Windows shows them in the headset instead.
+void DesktopNotify(const std::string& text) {
+#ifndef _WIN32
+  std::string q = "'";
+  for (char c : text) q += c == '\'' ? std::string("'\\''") : std::string(1, c);
+  q += "'";
+  std::system(("notify-send openhouse " + q + " >/dev/null 2>&1 &").c_str());
+#else
+  (void)text;
+#endif
+}
+
 int RunDesktop() {
   constexpr int kBaseW = 1280, kBaseH = 800;
   const bool snapshot = std::getenv("OPENHOUSE_OVERLAY_SNAPSHOT") != nullptr;
@@ -159,6 +171,7 @@ int RunDesktop() {
       scaleSave = true;
     }
     ui.Draw(ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y);
+    for (const auto& a : ui.TakeAlerts()) DesktopNotify(a);
     ImGui::Render();
     int w, h;
     glfwGetFramebufferSize(window, &w, &h);
@@ -361,6 +374,19 @@ int RunOverlay() {
     ImGui_ImplOpenGL2_NewFrame();
     ImGui::NewFrame();
     ui.Draw(float(kTextureWidth), float(kTextureHeight));
+    for (const auto& a : ui.TakeAlerts()) {
+#ifdef _WIN32
+      if (vr::IVRNotifications* n = vr::VRNotifications()) {
+        vr::NotificationBitmap_t logo;
+        logo.m_pImageData = const_cast<uint8_t*>(kLogoRgba);
+        logo.m_nWidth = kLogoSize; logo.m_nHeight = kLogoSize; logo.m_nBytesPerPixel = 4;
+        vr::VRNotificationId id = 0;
+        n->CreateNotification(main, 0, vr::EVRNotificationType_Transient, a.c_str(), vr::EVRNotificationStyle_Application, &logo, &id);
+      }
+#else
+      DesktopNotify(a);
+#endif
+    }
     ImGui::Render();
     fbo.bindFramebuffer(GL_FRAMEBUFFER, fbo.framebuffer);
     glViewport(0, 0, kTextureWidth, kTextureHeight);
