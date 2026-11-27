@@ -1098,7 +1098,10 @@ static void ru_tick(void)
   for (int k = 0; k < 2; k++) {                             /* auto repeaters gone quiet */
     if (!((sat_auto >> k) & 1)) continue;
     const uint32_t last = sats[k].last_ms && (int32_t)(sats[k].last_ms - sat_seen_ms[k]) > 0 ? sats[k].last_ms : sat_seen_ms[k];
-    if (ms_ticks - last > SAT_AUTO_DROP_MS) { sat_auto &= (uint8_t)~(1u << k); sat_on &= (uint8_t)~(1u << k); }
+    if (ms_ticks - last > SAT_AUTO_DROP_MS) {   /* gone: no trace of it either (apps show recent ones) */
+      sat_auto &= (uint8_t)~(1u << k); sat_on &= (uint8_t)~(1u << k);
+      memset(&sats[k], 0, sizeof sats[k]); sat_rssi16[k] = 0;
+    }
   }
   if (!sat_on) { ru_on = 0; return; }
   if (!ru_on) {

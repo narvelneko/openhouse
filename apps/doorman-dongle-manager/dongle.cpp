@@ -612,6 +612,7 @@ void Dongle::PollRepeater(double now) {
     state_.relaying = a.data[36] == 1;
     state_.uselessFor = fw32 ? a.data[37] : 0;
     state_.autoMask = a.data[38] & 3;
+    state_.autoSeen = uint8_t((state_.autoSeen | state_.autoMask) & ~(state_.satMask & ~state_.autoMask));
     for (int k = 0; k < kMaxRepeaters; ++k) {
       auto& x = state_.autoReps[k];
       if (!(state_.autoMask >> k & 1)) { x = {}; continue; }

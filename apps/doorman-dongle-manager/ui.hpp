@@ -50,7 +50,6 @@ class Ui {
   void RepeaterSelf(const DongleState& d);
   void RepeaterSpare(const DongleState& d);
   void DongleStrip(const DongleState& d);
-  void LinkScene(const DongleState& d);
   void PlacementPanel(bool tooFar);
   void RepeaterModals();
   void Link(const std::string& from, const std::string& main, int id);   // asks first
@@ -94,7 +93,7 @@ class Ui {
   uint32_t infoOpen_ = 0;         // info blocks open (bits)
   bool placementOpen_ = false;
   double placeDoneAt_ = 0;        // set-up step 3 done (the repeater left USB and answers): when
-  std::string linkFrom_, linkTo_, returnFor_, useAsRepeater_;
+  std::string linkFrom_, linkTo_, returnFor_;
   int linkId_ = -1;               // the repeater id the link confirm gives
   bool openLink_ = false, openReturn_ = false;
   // per main serial and slot: mean loss with a repeater switched on [0] and with none on [1] (the A/B)

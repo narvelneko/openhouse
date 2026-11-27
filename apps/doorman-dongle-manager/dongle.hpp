@@ -130,6 +130,7 @@ struct DongleState {
   bool relaying = false;
   int uselessFor = 0;                  // s before a repeater that took back too little is asked again (0: none)
   uint8_t autoMask = 0;
+  uint8_t autoSeen = 0;                // ids a repeater joined on its own since this app started (not one set by hand)
   struct AutoRep { std::string serial; int board = -1, firmware = 0, state = -1, hearsMainRssi = 0, heardRssi = 0; };
   std::array<AutoRep, kMaxRepeaters> autoReps{};
   bool autoRepeater = false;           // a repeater on its own (it heard a main with devices); stored role 0

@@ -443,7 +443,7 @@ void Ui::Draw(float width, float height) {
 
 namespace {
 // What a plugged-in dongle is: the sidebar's list and the Repeater page's strip tell them apart by it.
-// Roles have fixed colours, apart from the health colours: main blue, repeater warm, spare grey.
+// Roles have fixed colours, apart from the health colours: dongles blue (with devices or not), repeaters warm.
 enum class Role { Main, Repeater, Spare };
 Role RoleOf(const DongleState& s) {
   if (s.haveRole && s.role == 1) return Role::Repeater;
@@ -451,10 +451,9 @@ Role RoleOf(const DongleState& s) {
 }
 ImVec4 RoleColor(const DongleState& s) {
   const Role r = RoleOf(s);
-  return r == Role::Main ? kInfo : r == Role::Repeater ? kAccent : kOff;
+  return r == Role::Repeater ? kAccent : kInfo;
 }
 const char* RoleWord(Role r) { return r == Role::Main ? "MAIN" : r == Role::Repeater ? "REPEATER" : "SPARE"; }
-const char* RoleName(Role r) { return r == Role::Main ? "Main" : r == Role::Repeater ? "Repeater" : "Spare"; }
 
 // A main's repeater socket. The main only asks a repeater for what it missed, so on a clean link nothing
 // is asked and nothing answered: that's Standby (fine), not a fault.
@@ -1061,7 +1060,7 @@ void Ui::Channels(const DongleState& d) {
 namespace {
 using lh::ui::Icon;
 
-constexpr uint32_t kInfoDongles = 1, kInfoMapMain = 2, kInfoMapRep = 4, kInfoAdd = 8, kInfoPlace = 16;
+constexpr uint32_t kInfoDongles = 1, kInfoMapMain = 2, kInfoMapRep = 4, kInfoPlace = 16;
 constexpr double kLossScale = 30;   // loss bars: 0 to 30 %
 const ImVec4 kText{0.92f, 0.94f, 0.97f, 1};
 const ImVec4 kMuted{0.62f, 0.64f, 0.68f, 1};
@@ -1079,26 +1078,13 @@ std::shared_ptr<Dongle> FindBySerial(const std::vector<std::shared_ptr<Dongle>>&
 }
 std::string Short4(const std::string& s) { return ShortSerial(s).substr(0, 4); }
 
-// The dongles a dongle can be linked to as a repeater: most paired devices first (that's the main).
-std::vector<std::shared_ptr<Dongle>> MainsFor(const std::vector<std::shared_ptr<Dongle>>& all, const std::string& from) {
-  std::vector<std::pair<int, std::shared_ptr<Dongle>>> v;
-  for (const auto& o : all) {
-    const auto s = o->Snapshot();
-    if (o->Serial() != from && s.open && s.extras && s.haveRole && s.role == 0 && s.netBase) v.push_back({s.paired, o});
-  }
-  std::stable_sort(v.begin(), v.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
-  std::vector<std::shared_ptr<Dongle>> out;
-  for (auto& [n, o] : v) out.push_back(o);
-  return out;
-}
-bool CanBeRepeater(const DongleState& s) { return s.open && s.extras && s.haveRole && s.role == 0; }
 
 // The repeater ids a main has: in its mask, a repeater of it plugged in here, or one that answered in the last
-// 10 minutes. A link only gives an id outside these, so two repeaters never share one.
+// 10 minutes.
 uint8_t KnownIds(const std::vector<std::shared_ptr<Dongle>>& all, const DongleState& m) {
   uint8_t ids = m.satMask;
   for (int k = 0; k < kMaxRepeaters; ++k)
-    if (m.relaySats[k].msSinceSrep < 600000) ids |= uint8_t(1u << k);
+    if (m.relaySats[k].msSinceSrep < 600000 && !(m.autoSeen >> k & 1)) ids |= uint8_t(1u << k);   // (one that joined on its own just goes)
   for (const auto& o : all) {
     const auto s = o->Snapshot();
     if (o->Serial() != m.serial && s.haveRole && s.role == 1 && s.mainBase == m.netBase) ids |= uint8_t(1u << s.satId);
@@ -1107,11 +1093,6 @@ uint8_t KnownIds(const std::vector<std::shared_ptr<Dongle>>& all, const DongleSt
 }
 // Most likely the spare and the main swapped: the dongle with the devices would become the repeater.
 bool WrongWay(const DongleState& from, const DongleState& m) { return from.paired > 0 && m.paired == 0; }
-int FreeId(uint8_t used) {
-  for (int k = 0; k < kMaxRepeaters; ++k)
-    if (!(used & (1u << k))) return k;
-  return -1;
-}
 
 // A repeater's own state, on USB.
 enum class Sat { Starting, Searching, Following, OffAtMain };
@@ -1542,43 +1523,6 @@ void Section(const char* label, uint32_t& open, uint32_t bit, Info lines, bool* 
 
 const InfoLine kNone{kText, nullptr, nullptr};
 
-// (1) Plug --- (2) Link --- (3) Place. Done = green with a tick, next = blue and pulsing, later = grey.
-void StepTracker(const bool done[3], double now) {
-  ImDrawList* dl = ImGui::GetWindowDrawList();
-  const float lh = ImGui::GetTextLineHeight(), fs = ImGui::GetFontSize(), r = lh * 0.95f, px = Px();
-  const ImVec2 p = ImGui::GetCursorScreenPos();
-  const float stepW = fs * 10.5f, cy = p.y + r;
-  const char* names[] = {"Plug", "Link", "Place"};
-  int next = 0;
-  while (next < 3 && done[next]) ++next;
-  for (int i = 0; i < 3; ++i) {
-    const ImVec2 c(p.x + r + float(i) * stepW, cy);
-    char num[4];
-    std::snprintf(num, sizeof num, "%d", i + 1);
-    if (done[i]) {
-      dl->AddCircleFilled(c, r, U32(kGood), 24);
-      dl->AddLine(ImVec2(c.x - r * 0.42f, c.y + r * 0.02f), ImVec2(c.x - r * 0.1f, c.y + r * 0.34f), IM_COL32(20, 23, 30, 255), 2.2f * px);
-      dl->AddLine(ImVec2(c.x - r * 0.1f, c.y + r * 0.34f), ImVec2(c.x + r * 0.45f, c.y - r * 0.32f), IM_COL32(20, 23, 30, 255), 2.2f * px);
-    } else if (i == next) {
-      const float a = 0.6f + 0.4f * float(0.5 + 0.5 * std::sin(now * 4));
-      dl->AddCircleFilled(c, r * 1.25f, U32(kInfo, 0.18f * a), 24);
-      dl->AddCircleFilled(c, r, U32(kInfo, a), 24);
-      TextCentered(dl, c, ImVec4(0.08f, 0.09f, 0.12f, 1), num);
-    } else {
-      dl->AddCircle(c, r - px, U32(kOff, 0.7f), 24, 1.5f * px);
-      TextCentered(dl, c, kOff, num);
-    }
-    const float tx = c.x + r + fs * 0.5f;
-    TextAt(dl, ImVec2(tx, cy - lh), done[i] || i == next ? kText : kOff, names[i]);
-    TextAt(dl, ImVec2(tx, cy), done[i] ? kGood : i == next ? kInfo : kOff, done[i] ? "done" : i == next ? "next" : "later");
-    if (i < 2) {
-      const float x0 = tx + ImGui::CalcTextSize("Place").x + fs * 0.7f, x1 = p.x + float(i + 1) * stepW - fs * 0.5f;
-      Line(dl, ImVec2(x0, cy), ImVec2(x1, cy), U32(done[i] ? kGood : kOff, done[i] ? 0.8f : 0.4f), 2 * px, done[i] ? Stroke::Solid : Stroke::Dotted);
-    }
-  }
-  ImGui::Dummy(ImVec2(stepW * 3, r * 2));
-}
-
 // Two dongles and an arrow between them: "this becomes a repeater of that", for the confirms.
 void PairPicture(const ImVec4& lc, const char* lw, const std::string& lid, const ImVec4& rc, const char* rw, const std::string& rid,
                  const ImVec4& arrow) {
@@ -1603,9 +1547,9 @@ void PairPicture(const ImVec4& lc, const char* lw, const std::string& lid, const
 
 // The info texts.
 const Info kInfoDonglesText = {
-    {kInfo, "Main", "has your devices paired."},
+    {kInfo, "Dongle", "your devices connect to it."},
     {kAccent, "Repeater", "helps a main from another spot in the room."},
-    {kOff, "Spare", "has nothing paired. A spare can become a repeater."},
+    {kText, nullptr, "A dongle with nothing connected becomes a repeater on its own near a dongle with devices."},
     {kText, nullptr, "Click a card to select that dongle."}};
 const Info kInfoMapMainText = {
     {kText, nullptr, "A repeater is a second dongle placed elsewhere in the room. The repeater listens to your devices. "
@@ -1616,7 +1560,7 @@ const Info kInfoMapMainText = {
     {kText, nullptr, "The bar shows loss. The whole bar is what the main misses alone. The striped green part is what the "
                      "repeater saved. The solid part is still lost."},
     kNone,
-    {kText, nullptr, "A repeater in use costs about 5 % of the update rate."}};
+    {kText, nullptr, "While relaying, a repeater costs about 5 % of the update rate. On standby it costs nothing."}};
 const Info kInfoSwitchText = {
     {kGood, "ON", "the main asks this repeater for the answers the main missed."},
     {kOff, "OFF", "the main works alone. The repeater stays linked."},
@@ -1634,13 +1578,6 @@ const Info kInfoMapRepText = {
     {kInfo, "OFF AT MAIN", "the repeater listens, but the main's switch for this repeater is off."},
     kNone,
     {kText, "heard", "is the share of each device's answers that reach the repeater."}};
-const Info kInfoAddText = {
-    {kText, "1.", "Plug in the main and a spare dongle."},
-    {kText, "2.", "Link the spare to the main."},
-    {kText, "3.", "Move the repeater to a charger across the room."},
-    kNone,
-    {kText, nullptr, "Both dongles need firmware with the repeater role."},
-    {kText, nullptr, "The repeater keeps the old pairings for a later return to normal."}};
 const Info kInfoPlaceText = {
     {kText, nullptr, "Unplug the repeater."},
     {kText, nullptr, "Power the repeater from a wall charger. Power banks can switch off."},
@@ -1889,7 +1826,9 @@ void Ui::DongleStrip(const DongleState& d) {
     float x = a.x + pad, y = a.y + pad;
     lh::ui::DrawIcon(dl, role == Role::Repeater ? Icon::Repeater : Icon::Dongle, ImVec2(x + tlh / 2, y + tlh / 2), tlh, U32(rc, alpha));
     const float tx = x + tlh + fs * 0.45f;
-    TextAt(dl, ImVec2(tx, y), rc, RoleWord(role), g_title, alpha);
+    std::string board = BoardWord(s.board);
+    for (auto& ch : board) ch = char(std::toupper(static_cast<unsigned char>(ch)));
+    TextAt(dl, ImVec2(tx, y), rc, board.c_str(), g_title, alpha);   // (its role shows in the colour, the icon and row 3)
     y += tlh + fs * 0.2f;
     float sx = x;
     if (role == Role::Repeater && s.haveRole) {
@@ -1905,7 +1844,7 @@ void Ui::DongleStrip(const DongleState& d) {
       UpdateChip(dl, x, cy);
     } else if (!s.haveRole) {
       WaitDots(dl, ImVec2(x, cy), fs * 0.25f, kOff, now_);
-    } else if (role == Role::Main) {
+    } else if (role == Role::Main || role == Role::Spare) {
       SlotPips(dl, ImVec2(x, cy), fs * 0.26f, s);
     } else if (role == Role::Repeater) {
       const auto main = FindByNetBase(all, s.mainBase, s.serial);
@@ -1916,17 +1855,6 @@ void Ui::DongleStrip(const DongleState& d) {
         const Sat st = SatState(s, &ms);
         const float w = LedGlyph(dl, ImVec2(x, cy), lh, st == Sat::Searching ? Led::Searching : Led::Following, now_, st == Sat::Starting ? 0.4f : 1);
         TextAt(dl, ImVec2(x + w + fs * 0.4f, cy - lh / 2), SatColor(st), SatWord(st));
-      }
-    } else {   // a spare: Link, when there's a main to link it to
-      const auto mains = MainsFor(all, s.serial);
-      std::shared_ptr<Dongle> target;
-      for (const auto& o : mains)
-        if (!target && RoleOf(o->Snapshot()) == Role::Main) target = o;
-      if (RoleOf(d) == Role::Main && d.serial != s.serial && std::any_of(mains.begin(), mains.end(), [&](const auto& o) { return o->Serial() == d.serial; }))
-        target = FindBySerial(all, d.serial);   // the main shown on the page
-      if (target && CanBeRepeater(s)) {
-        ImGui::SetCursorScreenPos(ImVec2(x, y));
-        if (SmallTint("+ Link", kInfo)) Link(s.serial, target->Serial(), FreeId(KnownIds(all, target->Snapshot())));
       }
     }
     ImGui::PopID();
@@ -1961,12 +1889,6 @@ void Ui::RepeaterMain(const DongleState& d) {
     if (o->Serial() != d.serial && s.haveRole && s.role == 1 && s.mainBase == d.netBase && s.satId >= 0 && s.satId < kMaxRepeaters)
       who[s.satId] = s.serial;
   }
-  std::string spare;
-  for (const auto& o : all) {
-    const auto s = o->Snapshot();
-    if (spare.empty() && o->Serial() != d.serial && CanBeRepeater(s) && RoleOf(s) == Role::Spare && s.netBase) spare = s.serial;
-  }
-  const auto spareDongle = FindBySerial(all, spare);
   std::array<Sock, kMaxRepeaters> sock{};
   bool anyOn = false, anyAnswer = false, anyLost = false;
   for (int k = 0; k < kMaxRepeaters; ++k) {
@@ -1985,11 +1907,9 @@ void Ui::RepeaterMain(const DongleState& d) {
   const bool madeOnUsb = setUp && FindBySerial(all, made);
 
   // the set-up steps: while this main has no repeater, or a set-up runs
-  if (!known || setUp) {
-    Section("ADD A REPEATER", infoOpen_, kInfoAdd, kInfoAddText);
-    const bool done[3] = {setUp || !spare.empty(), setUp, setUp && placeDoneAt_ > 0};
+  if (!known) {
     ImGui::Spacing();
-    StepTracker(done, now_);
+    ImGui::TextColored(kMuted, "No repeater. Any dongle with nothing connected nearby becomes one on its own.");
   }
   if (placementOpen_ && setUp) PlacementPanel(sock[madeId] == Sock::Lost && !madeOnUsb);
 
@@ -2015,9 +1935,6 @@ void Ui::RepeaterMain(const DongleState& d) {
   }
 
   // the sockets and the backhaul to each
-  int firstEmpty = -1;
-  for (int k = 0; k < kMaxRepeaters; ++k)
-    if (firstEmpty < 0 && sock[k] == Sock::Empty) firstEmpty = k;
   for (int k = 0; k < kMaxRepeaters; ++k) {
     const Sock st = sock[k];
     const ImVec4 sc = SockColor(st);
@@ -2040,14 +1957,7 @@ void Ui::RepeaterMain(const DongleState& d) {
       dl->AddLine(ImVec2(c.x, c.y - tlh * 0.2f), ImVec2(c.x, c.y + tlh * 0.2f), U32(kOff), 1.5f * px);
       TextAt(dl, ImVec2(c.x + tlh / 2 + fs * 0.45f, a.y + pad), kOff, RName(k).c_str(), g_title);
       const float y = a.y + pad + tlh + fs * 0.3f;
-      if (spareDongle) {   // any empty socket: the spare becomes that id
-        ImGui::SetCursorScreenPos(ImVec2(a.x + pad, y));
-        if (SmallTint(("Link " + Short4(spare)).c_str(), kInfo)) Link(spare, d.serial, k);
-      } else if (!spareDongle && k == firstEmpty) {
-        TextAt(dl, ImVec2(a.x + pad, y + (fh - lh) / 2), kInfo, "Plug in a spare");
-      } else {
-        TextAt(dl, ImVec2(a.x + pad, y + (fh - lh) / 2), kOff, "Empty");
-      }
+      TextAt(dl, ImVec2(a.x + pad, y + (fh - lh) / 2), kOff, "Empty");
       ImGui::PopID();
       continue;
     }
@@ -2239,91 +2149,13 @@ void Ui::RepeaterMain(const DongleState& d) {
     ImGui::Dummy(ImVec2(W - bw - fs, fh));
   }
   if (placementOpen_ && !setUp) PlacementPanel(false);
-  // a main with devices can still be made a repeater of another dongle, but tucked away: rarely meant
-  const auto others = MainsFor(all, d.serial);
-  if (!d.satMask && std::any_of(others.begin(), others.end(), [](const auto& o) { return RoleOf(o->Snapshot()) == Role::Main; })) {
-    ImGui::Spacing();
-    const bool open = useAsRepeater_ == d.serial;
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
-    if (ImGui::SmallButton(open ? "Use as repeater  -" : "Use as repeater  +")) useAsRepeater_ = open ? "" : d.serial;
-    ImGui::PopStyleColor(2);
-    if (open) LinkScene(d);
-  }
 }
 
-// The spare's view: the set-up steps and the link scene.
+// A dongle with nothing connected: it becomes a repeater by itself near a dongle that has devices.
 void Ui::RepeaterSpare(const DongleState& d) {
-  const auto mains = MainsFor(manager_.Dongles(), d.serial);
-  const bool haveMain = std::any_of(mains.begin(), mains.end(), [](const auto& o) { return RoleOf(o->Snapshot()) == Role::Main; });
-  Section("ADD A REPEATER", infoOpen_, kInfoAdd, kInfoAddText);
-  const bool done[3] = {haveMain, false, false};
+  (void)d;
   ImGui::Spacing();
-  StepTracker(done, now_);
-  ImGui::Spacing();
-  LinkScene(d);
-}
-
-// This dongle ===> the main it would repeat for, and the button. More than one main: arrows on the main
-// node cycle through them.
-void Ui::LinkScene(const DongleState& d) {
-  const auto& all = manager_.Dongles();
-  const auto mains = MainsFor(all, d.serial);
-  if (!mains.empty() && std::none_of(mains.begin(), mains.end(), [&](const auto& o) { return o->Serial() == repeaterMain_; }))
-    repeaterMain_ = mains.front()->Serial();
-  std::shared_ptr<Dongle> main;
-  for (const auto& o : mains)
-    if (o->Serial() == repeaterMain_) main = o;
-  const DongleState m = main ? main->Snapshot() : DongleState{};
-  const bool wrongWay = main && WrongWay(d, m);
-  const int id = main ? FreeId(KnownIds(all, m)) : -1;
-  ImDrawList* dl = ImGui::GetWindowDrawList();
-  const float fs = ImGui::GetFontSize(), lh = ImGui::GetTextLineHeight(), fh = ImGui::GetFrameHeight(), px = Px(), tlh = TitleHeight();
-  const float W = ImGui::GetContentRegionAvail().x, nodeW = fs * 10, nodeH = fs * 4.2f + tlh + lh + fs * 0.8f, gap = fs * 16;
-  const ImVec2 p = ImGui::GetCursorScreenPos();
-  const float x0 = p.x + std::max(0.f, (W - nodeW * 2 - gap) / 2);
-  const auto node = [&](float x, const DongleState* s, const ImVec4& c, const char* word) {
-    NodeCard(dl, ImVec2(x, p.y), ImVec2(x + nodeW, p.y + nodeH), c, word, s ? ShortSerial(s->serial) : "",
-             s && RoleOf(*s) == Role::Main ? s : nullptr, nullptr, s ? nullptr : "Plug in the main");
-  };
-  node(x0, &d, RoleColor(d), RoleWord(RoleOf(d)));
-  node(x0 + nodeW + gap, main ? &m : nullptr, kInfo, "MAIN");
-  // the arrow, with the radio above it; red and crossed out when it's the wrong way round
-  const float ay = p.y + nodeH / 2, ax0 = x0 + nodeW + fs * 0.8f, ax1 = x0 + nodeW + gap - fs * 0.8f;
-  const ImVec4 ac = wrongWay ? kBad : main ? kAccent : kOff;
-  if (main) dl->AddLine(ImVec2(ax0, ay), ImVec2(ax1 - fs * 0.6f, ay), U32(ac), 3 * px);
-  else Line(dl, ImVec2(ax0, ay), ImVec2(ax1 - fs * 0.6f, ay), U32(ac, 0.6f), 2 * px, Stroke::Dashed);
-  Arrowhead(dl, ImVec2(ax1, ay), 1, 0, fs * 0.8f, U32(ac, main ? 1.f : 0.6f));
-  const float mx = (ax0 + ax1) / 2;
-  lh::ui::DrawIcon(dl, Icon::Repeater, ImVec2(mx, ay - fs * 1.4f), fs * 1.8f, U32(ac, main ? 1.f : 0.5f));
-  if (wrongWay) {
-    const float s = fs * 0.7f;
-    dl->AddLine(ImVec2(mx - s, ay - s), ImVec2(mx + s, ay + s), U32(kBad), 3 * px);
-    dl->AddLine(ImVec2(mx - s, ay + s), ImVec2(mx + s, ay - s), U32(kBad), 3 * px);
-    const std::string t = Short4(d.serial) + " has your devices";
-    TextCentered(dl, ImVec2(mx, ay + fs * 1.5f), kBad, t.c_str());
-  } else if (id >= 0) {
-    TextCentered(dl, ImVec2(mx, ay + fs * 1.3f), kMuted, RName(id).c_str());
-  }
-  // more than one main: < > under the main node
-  if (mains.size() > 1) {
-    const float cx = x0 + nodeW + gap + nodeW / 2;
-    ImGui::SetCursorScreenPos(ImVec2(cx - fh * 1.6f, p.y + nodeH + fs * 0.3f));
-    size_t at = 0;
-    for (size_t i = 0; i < mains.size(); ++i)
-      if (mains[i] == main) at = i;
-    if (ImGui::ArrowButton("##prevmain", ImGuiDir_Left)) repeaterMain_ = mains[(at + mains.size() - 1) % mains.size()]->Serial();
-    ImGui::SameLine(0, fh * 1.2f);
-    if (ImGui::ArrowButton("##nextmain", ImGuiDir_Right)) repeaterMain_ = mains[(at + 1) % mains.size()]->Serial();
-  }
-  const char* label = main && !wrongWay && id < 0 ? "Main is full" : "Link as repeater";
-  const float bw = fs * 14, by = p.y + nodeH + fs * 0.3f + fh + fs * 0.6f;
-  ImGui::SetCursorScreenPos(ImVec2(x0 + (nodeW * 2 + gap - bw) / 2, by));
-  ImGui::BeginDisabled(!main || wrongWay || id < 0 || !CanBeRepeater(d));
-  if (TintButton(label, kAccent, bw)) Link(d.serial, main->Serial(), id);
-  ImGui::EndDisabled();
-  ImGui::SetCursorScreenPos(p);
-  ImGui::Dummy(ImVec2(W, by + fh * 1.25f - p.y));
+  ImGui::TextColored(kMuted, "Nothing connected. Becomes a repeater on its own when it hears a dongle with devices.");
 }
 
 // The repeater's own view, on USB: what it hears, the same as on its charger.
@@ -2333,13 +2165,6 @@ void Ui::RepeaterSelf(const DongleState& d) {
   const DongleState ms = main ? main->Snapshot() : DongleState{};
   const Sat sat = SatState(d, main ? &ms : nullptr);
   const ImVec4 sc = SatColor(sat);
-  const bool setUp = SetUpFor(d.serial);
-  if (setUp) {
-    Section("ADD A REPEATER", infoOpen_, kInfoAdd, kInfoAddText);
-    const bool done[3] = {true, true, false};
-    ImGui::Spacing();
-    StepTracker(done, now_);
-  }
   if (placementOpen_) PlacementPanel(false);
 
   Section("LINK MAP", infoOpen_, kInfoMapRep, kInfoMapRepText);
